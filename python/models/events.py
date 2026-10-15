@@ -136,3 +136,6 @@ class IncidentState(BaseModel):
     current_agent: AgentType = AgentType.MONITOR
     retry_count: int = 0
     error_message: Optional[str] = None
+    # Orchestrator.run(metadata=...) 会写入、MonitorAgent 会读取 metric_data / rule_violation。
+    # 缺此字段会让所有带 metadata 的工作流调用抛 ValueError，导致采集循环每周期失败。
+    metadata: dict[str, Any] = Field(default_factory=dict)
