@@ -19,7 +19,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
-from collectors.prometheus_collector import MonitorLoop
+from collectors.prometheus_collector import MonitorLoop, PrometheusClient
 from config.settings import settings
 from core.event_bus import InMemoryEventBus
 from core.orchestrator import Orchestrator
@@ -45,7 +45,10 @@ async def lifespan(app: FastAPI):
     global orchestrator, knowledge_graph, monitor_loop
 
     await event_bus.start()
-    orchestrator = Orchestrator(event_bus)
+    # 阶段 4：RCA 回查 Prometheus 实测值以证实/证伪候选根因
+    orchestrator = Orchestrator(
+        event_bus, evidence_provider=PrometheusClient(settings.prometheus_url)
+    )
     knowledge_graph = create_demo_knowledge_graph()
 
     monitor_task: Optional[asyncio.Task] = None

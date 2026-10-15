@@ -78,8 +78,10 @@ class Orchestrator:
     - 状态 = IncidentState
     """
 
-    def __init__(self, event_bus: EventBus):
+    def __init__(self, event_bus: EventBus, evidence_provider=None):
         self.event_bus = event_bus
+        # 阶段 4：证据提供者（PrometheusClient）注入 RCAAgent，用于回查实测值证实/证伪候选根因
+        self._evidence_provider = evidence_provider
         self._nodes: list[WorkflowNode] = []
         self._checkpoints: dict[str, IncidentState] = {}
         self._build_default_workflow()
@@ -87,7 +89,7 @@ class Orchestrator:
     def _build_default_workflow(self) -> None:
         """构建默认工作流：Monitor → RCA → Heal → Change"""
         monitor = MonitorAgent(self.event_bus)
-        rca = RCAAgent(self.event_bus)
+        rca = RCAAgent(self.event_bus, evidence_provider=self._evidence_provider)
         heal = HealAgent(self.event_bus, dry_run=True)
         change = ChangeAgent(self.event_bus)
 
