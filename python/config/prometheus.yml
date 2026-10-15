@@ -8,6 +8,22 @@ scrape_configs:
       - targets: ['host.docker.internal:8000']
     metrics_path: '/metrics'
 
+  # 二次开发：为短链平台添加指标采集。
+  # - target 用 host.docker.internal:8082（DOCKER DESKTOP 自动映射宿主机回环，
+  #   与 aiops-agents 同源机制，已验证可用）
+  # - 该端点由 shortlink Spring Boot 的 actuator + micrometer-registry-prometheus 暴露
+  #   （见 shortlink 项目 application.yml 的 management.endpoints.web.exposure.include）
+  # - 关键 series：AIOps 重点消费 shortlink_consume_lag（基于 t_consumer_offset 真相源，
+  #   不是 Kafka broker 的 LAG，见 shortlink 文档 §9.4 假 lag 解释）
+  - job_name: 'shortlink-app'
+    metrics_path: '/actuator/prometheus'
+    scrape_interval: 15s
+    static_configs:
+      - targets: ['host.docker.internal:8082']
+        labels:
+          service: 'shortlink'
+          env: 'local'
+
   - job_name: 'prometheus'
     static_configs:
       - targets: ['localhost:9090']
