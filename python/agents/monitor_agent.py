@@ -126,7 +126,14 @@ class MonitorAgent(BaseAgent):
         self._history_max_len = 1000
 
     async def process(self, state: IncidentState) -> IncidentState:
-        """处理入站指标数据，检测异常并生成告警"""
+        """处理入站指标数据，检测异常并生成告警
+
+        两层检测：
+        1. 静态业务规则（metadata.rule_violation）：由 Prometheus 采集器按
+           短链平台业务阈值预判定，直接生成告警 —— 无冷启动问题
+        2. 统计异常检测：多算法投票（3-sigma / EWMA / Isolation Forest），
+           需要历史样本（≥5~10 个），适合捕获未知突变
+        """
         metric_data = state.metadata.get("metric_data")
         if not metric_data:
             state = await self._generate_demo_alert(state)
@@ -141,40 +148,84 @@ class MonitorAgent(BaseAgent):
         if len(self._history[metric_name]) > self._history_max_len:
             self._history[metric_name] = self._history[metric_name][-self._history_max_len:]
 
-        history = self._history[metric_name]
+        rule_violation = state.metadata.get("rule_violation")
+        if rule_violation:
+            alert = self._build_rule_alert(
+                rule_violation, metric_name, current_value,
+                target_service, labels, state.incident_id,
+            )
+        else:
+            history = self._history[metric_name]
+            is_anomaly, score = self._detect_anomaly(history, current_value)
+            if not is_anomaly:
+                return state
+            alert = self._build_statistical_alert(
+                metric_name, current_value, target_service,
+                labels, score, state.incident_id,
+            )
 
-        is_anomaly, score = self._detect_anomaly(history, current_value)
-
-        if not is_anomaly:
-            return state
-
-        fingerprint = self._fingerprint.compute(metric_name, target_service, labels)
+        fingerprint = self._fingerprint.compute(alert.alert_name, target_service, labels)
         if self._fingerprint.is_duplicate(fingerprint):
-            logger.info(f"[MonitorAgent] Alert suppressed (duplicate): {metric_name}")
+            logger.info(f"[MonitorAgent] Alert suppressed (duplicate): {alert.alert_name}")
             return state
-
-        severity = self._classify_severity(score)
-
-        alert = AlertEvent(
-            alert_name=f"anomaly_{metric_name}",
-            severity=severity,
-            source="prometheus",
-            target_service=target_service,
-            metric_name=metric_name,
-            metric_value=current_value,
-            threshold=score,
-            description=f"Anomaly detected on {metric_name}: value={current_value:.2f}, score={score:.2f}",
-            labels=labels,
-            correlation_id=state.incident_id,
-        )
 
         state.alert_event = alert
         state.status = "investigating"
 
         await self.event_bus.publish("aiops.alerts", alert)
-        logger.info(f"[MonitorAgent] Alert fired: {alert.alert_name} [{severity.value}]")
+        logger.info(f"[MonitorAgent] Alert fired: {alert.alert_name} [{alert.severity.value}]")
 
         return state
+
+    @staticmethod
+    def _build_rule_alert(
+        rule: dict,
+        metric_name: str,
+        value: float,
+        target_service: str,
+        labels: dict,
+        correlation_id: str,
+    ) -> AlertEvent:
+        """静态业务规则命中 → 直接生成告警（阈值判定已由采集器完成）"""
+        return AlertEvent(
+            alert_name=rule.get("name", f"rule_{metric_name}"),
+            severity=Severity(rule.get("severity", "high")),
+            source="prometheus",
+            target_service=target_service,
+            metric_name=metric_name,
+            metric_value=value,
+            threshold=rule.get("threshold", 0.0),
+            description=(
+                f"{rule.get('description', '业务规则命中')}: "
+                f"metric={metric_name}, value={value}, "
+                f"threshold={rule.get('threshold')} ({rule.get('comparator', 'gt')})"
+            ),
+            labels=labels,
+            correlation_id=correlation_id,
+        )
+
+    @staticmethod
+    def _build_statistical_alert(
+        metric_name: str,
+        value: float,
+        target_service: str,
+        labels: dict,
+        score: float,
+        correlation_id: str,
+    ) -> AlertEvent:
+        """统计异常检测命中 → 按异常分数分级生成告警"""
+        return AlertEvent(
+            alert_name=f"anomaly_{metric_name}",
+            severity=MonitorAgent._classify_severity(score),
+            source="prometheus",
+            target_service=target_service,
+            metric_name=metric_name,
+            metric_value=value,
+            threshold=score,
+            description=f"Anomaly detected on {metric_name}: value={value:.2f}, score={score:.2f}",
+            labels=labels,
+            correlation_id=correlation_id,
+        )
 
     def _detect_anomaly(self, history: list[float], current: float) -> tuple[bool, float]:
         """多算法投票机制：至少两种算法认为异常才报警"""

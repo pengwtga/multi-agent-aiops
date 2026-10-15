@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     prometheus_url: str = "http://localhost:9090"
 
     # Agent 配置
+    monitor_enabled: bool = True   # 阶段 3：Prometheus 真实采集循环开关
     monitor_check_interval: int = 30
     rca_max_depth: int = 5
     heal_dry_run: bool = True

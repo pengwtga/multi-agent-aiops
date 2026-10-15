@@ -9,14 +9,18 @@
 """
 
 import asyncio
+import contextlib
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
+from collectors.prometheus_collector import MonitorLoop
+from config.settings import settings
 from core.event_bus import InMemoryEventBus
 from core.orchestrator import Orchestrator
 from core.knowledge_graph import create_demo_knowledge_graph, InMemoryKnowledgeGraph
@@ -32,19 +36,37 @@ logger = logging.getLogger(__name__)
 event_bus = InMemoryEventBus()
 orchestrator: Optional[Orchestrator] = None
 knowledge_graph: Optional[InMemoryKnowledgeGraph] = None
+monitor_loop: Optional[MonitorLoop] = None
 incident_history: list[dict[str, Any]] = []
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global orchestrator, knowledge_graph
+    global orchestrator, knowledge_graph, monitor_loop
 
     await event_bus.start()
     orchestrator = Orchestrator(event_bus)
     knowledge_graph = create_demo_knowledge_graph()
 
+    monitor_task: Optional[asyncio.Task] = None
+    if settings.monitor_enabled:
+        # 阶段 3：真实 Prometheus 采集循环，按 settings.monitor_check_interval 轮询
+        monitor_loop = MonitorLoop(
+            orchestrator,
+            prometheus_url=settings.prometheus_url,
+            interval_seconds=settings.monitor_check_interval,
+        )
+        monitor_task = asyncio.create_task(monitor_loop.run_forever())
+
     logger.info("AIOps Multi-Agent System started")
     yield
+
+    if monitor_loop:
+        monitor_loop.stop()
+    if monitor_task:
+        monitor_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await monitor_task
 
     await event_bus.stop()
     logger.info("AIOps Multi-Agent System stopped")
@@ -209,6 +231,30 @@ async def get_agent_status():
         "workflow_nodes": orchestrator.get_workflow_status() if orchestrator else [],
         "event_log_size": len(event_bus.get_event_log()) if hasattr(event_bus, "get_event_log") else 0,
     }
+
+
+@app.get("/api/v1/monitor/status")
+async def get_monitor_status():
+    """查看 Prometheus 采集循环状态：规则集 / 周期数 / 已触发告警"""
+    if not monitor_loop:
+        raise HTTPException(status_code=503, detail="Monitor loop not enabled")
+    return monitor_loop.status()
+
+
+@app.get("/metrics", response_class=PlainTextResponse)
+async def prometheus_metrics():
+    """自观测指标（Prometheus exposition 格式）。
+
+    供 config/prometheus.yml 里 aiops-agents 抓取作业使用。
+    """
+    if monitor_loop:
+        return monitor_loop.get_metrics_text()
+    return (
+        "# TYPE aiops_monitor_cycles_total counter\n"
+        "aiops_monitor_cycles_total 0\n"
+        "# TYPE aiops_monitor_alerts_total counter\n"
+        "aiops_monitor_alerts_total 0\n"
+    )
 
 
 @app.get("/health")
