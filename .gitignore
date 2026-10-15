@@ -1,0 +1,18 @@
+# Build
+java/target/
+__pycache__/
+*.pyc
+*.class
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
+
+# Local
+.env
+.env.local
+*.log
