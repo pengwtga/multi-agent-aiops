@@ -45,6 +45,32 @@ class Settings(BaseSettings):
     # （重启 Redis 期间所有跳转失败），0.2 会把所有重启类动作都降级成人工，故放宽到 0.5
     blast_radius_max_percent: float = 0.5
 
+    # 故障演练（Dashboard 页面「故障演练 / 恢复容器」按钮）
+    # 默认关闭 —— 这是唯一能主动停止容器的入口，必须显式开启
+    # 走独立路径、不过 ChangeAgent 审批：演练本身就是人主动注入故障，
+    # 等同于人工操作，再让 Agent 审批一次人为故障没有意义
+    drill_enabled: bool = False
+    # 允许被演练操作的容器白名单（逗号分隔）
+    drill_containers: str = (
+        "shortlink-redis,shortlink-mysql,shortlink-app,shortlink-kafka"
+    )
+    # 探测负载：注入故障后自动打一批**并发**请求
+    #
+    # 为什么需要它：dependency_hang 的判据是「连接堆积 + 成功吞吐归零」，
+    # 必须有请求进来连接才会堆积。实测空闲时 Tomcat 连接数只有 2，
+    # 光停 Redis 而无人访问，故障将永远不可见（不告警、不自愈）。
+    # 演练的目的是验证闭环，故由后端自动补上负载。
+    #
+    # count 必须足够大且**并发**发出：串行请求同时只占 1 个连接，
+    # 堆不出判据所需的连接数。timeout 需跨过 Prometheus 抓取周期（15s），
+    # 否则连接在采到之前就释放了。
+    drill_probe_count: int = 50
+    drill_probe_timeout: int = 25
+    shortlink_base_url: str = "http://localhost:8082"
+    # 探测用短链码。留空则自动从 Redis scan 一个真实存在的 code
+    # （必须真实存在：不存在的 code 会被直接 404，碰不到 Redis，造不出挂起）
+    drill_probe_code: str = ""
+
     model_config = {"env_prefix": "AIOPS_", "env_file": ".env"}
 
 

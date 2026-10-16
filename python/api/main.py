@@ -27,6 +27,9 @@ from core.knowledge_graph import create_demo_knowledge_graph, InMemoryKnowledgeG
 from models.events import IncidentState, Severity
 from models.time_series import EnsembleDetector, generate_demo_metrics
 
+# 阶段 5 可视化：自愈闭环 Dashboard 页面与状态聚合函数
+from api.dashboard import build_state, router as dashboard_router
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
@@ -84,6 +87,9 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+# 阶段 5：挂载自愈闭环可视化页面（GET /dashboard）
+app.include_router(dashboard_router)
 
 
 class TriggerRequest(BaseModel):
@@ -245,6 +251,179 @@ async def get_monitor_status():
     if not monitor_loop:
         raise HTTPException(status_code=503, detail="Monitor loop not enabled")
     return monitor_loop.status()
+
+
+@app.get("/dashboard/state")
+async def get_dashboard_state():
+    """Dashboard 页面数据源：把监控循环 / 事件历史 / 流水线节点聚合成一份"""
+    if not orchestrator:
+        raise HTTPException(status_code=503, detail="Orchestrator not initialized")
+
+    return build_state(
+        monitor_status=(monitor_loop.status() if monitor_loop else None),
+        incidents={
+            "total": len(incident_history),
+            "incidents": incident_history[-50:],
+        },
+        workflow=orchestrator.get_workflow_status(),
+        drill_enabled=settings.drill_enabled,
+    )
+
+
+class DrillRequest(BaseModel):
+    action: str = "inject"            # inject | restore
+    container: str = "shortlink-redis"
+
+
+async def _resolve_probe_code() -> Optional[str]:
+    """拿一个**真实存在**的短链码用于探测
+
+    为什么不能用任意 code（实测踩过）：
+        请求不存在的短链时应用直接返回 404，**根本不查 Redis**，
+        造不出挂起连接，探测等于白打。只有真实 code 才会走到
+        `sl:link:{code}` 读路径，从而在 Redis 停机时挂住。
+
+    优先级：
+      1. 显式配置 settings.drill_probe_code
+      2. 否则从 Redis scan 出真实 key 再反解 code
+    """
+    if settings.drill_probe_code:
+        return settings.drill_probe_code
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "exec", "shortlink-redis",
+            "redis-cli", "--scan", "--pattern", "sl:link:*",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        for line in (out or b"").decode(errors="replace").splitlines():
+            line = line.strip()
+            if line.startswith("sl:link:"):
+                return line.split("sl:link:", 1)[1]
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[DRILL] 从 Redis 获取短链码失败: {e}")
+    return None
+
+
+async def _probe_load(code: Optional[str] = None) -> dict:
+    """故障演练的探测负载：并发打一批跳转请求
+
+    为什么需要它（实测踩出来的）：
+        dependency_hang 的判据是「Tomcat 连接堆积 + 成功跳转吞吐归零」，
+        必须有请求进来连接才会堆积。实测空闲时 Tomcat 连接数只有 2，
+        光停 Redis 而无人访问 → 判据不成立 → 故障不可见 → 不告警不自愈。
+        演练的目的是验证闭环，故由后端自动补上负载。
+
+    两点不能省：
+        - 必须**并发**：串行请求同时只占 1 个连接，堆不出所需连接数
+        - timeout 要跨过 Prometheus 抓取周期（15s）：否则连接在
+          被采到之前就释放了，指标上依然看不到堆积
+    """
+    if not code:  # 调用方未取到时兜底再试一次
+        code = await _resolve_probe_code()
+    if not code:
+        logger.warning("[DRILL] 未拿到探测短链码，跳过探测负载")
+        return {"requests": 0, "timeout_seconds": 0, "skipped": True}
+
+    url = f"{settings.shortlink_base_url.rstrip('/')}/{code}"
+    n = settings.drill_probe_count
+    t = settings.drill_probe_timeout
+
+    procs: list = []
+    for _ in range(n):
+        try:
+            procs.append(
+                await asyncio.create_subprocess_exec(
+                    "curl", "-s", "-o", "/dev/null",
+                    "--max-time", str(t), url,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[DRILL] 探测请求启动失败: {e}")
+
+    async def _wait(p) -> None:
+        try:
+            await asyncio.wait_for(p.wait(), timeout=t + 5)
+        except Exception:  # noqa: BLE001
+            p.kill()
+            await p.wait()
+
+    await asyncio.gather(*[_wait(p) for p in procs], return_exceptions=True)
+    logger.warning(f"[DRILL] 探测负载完成：{len(procs)} 并发，timeout={t}s")
+    return {"requests": len(procs), "timeout_seconds": t}
+
+
+@app.post("/api/v1/drill/inject")
+async def drill_inject(request: DrillRequest):
+    """故障演练：停止 / 恢复指定容器（供 Dashboard 页面操作）
+
+    四道护栏：
+    1. 总开关  —— settings.drill_enabled，默认 False，未显式开启直接 403
+    2. 白名单  —— 只能操作 settings.drill_containers 里列出的容器
+    3. 动作枚举 —— 只允许 inject（docker stop）/ restore（docker start）
+    4. 审计    —— 每次调用记 WARNING 日志，含 argv 与返回码
+
+    注意：这里走**独立的演练路径**，不经过 ChangeAgent 审批 —— 因为演练
+    本身就是「人主动注入故障」，等同于人工操作；让 Agent 去审批一次人为
+    故障没有意义。真实故障的自愈仍然严格走 heal_propose → change →
+    heal_execute 三段闸门。
+    """
+    if not settings.drill_enabled:
+        raise HTTPException(
+            status_code=403,
+            detail="故障演练未启用：需以 AIOPS_DRILL_ENABLED=true 启动服务",
+        )
+
+    allowed = [c.strip() for c in settings.drill_containers.split(",") if c.strip()]
+    if request.container not in allowed:
+        raise HTTPException(status_code=400, detail=f"容器不在白名单：{allowed}")
+
+    if request.action not in ("inject", "restore"):
+        raise HTTPException(status_code=400, detail="action 只能是 inject 或 restore")
+
+    sub = "stop" if request.action == "inject" else "start"
+    argv = ["docker", sub, request.container]
+
+    # 必须在注入**之前**取短链码：等 Redis 停了就扫不到真实 code 了
+    probe_code = None
+    if request.action == "inject":
+        probe_code = await _resolve_probe_code()
+        logger.warning(f"[DRILL] 探测短链码: {probe_code or '(未拿到)'}")
+
+    logger.warning(f"[DRILL] 故障演练执行：{' '.join(argv)}")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=30)
+        ok = proc.returncode == 0
+        logger.warning(f"[DRILL] 结果 rc={proc.returncode} ok={ok}")
+
+        # 注入成功后自动补负载：否则依赖挂起类故障不可见（不告警、不自愈）
+        probe = None
+        if ok and request.action == "inject":
+            probe = await _probe_load(probe_code)
+
+        return {
+            "ok": ok,
+            "action": request.action,
+            "container": request.container,
+            "argv": argv,
+            "returncode": proc.returncode,
+            "stdout": (out or b"").decode(errors="replace").strip()[-500:],
+            "stderr": (err or b"").decode(errors="replace").strip()[-500:],
+            "probe": probe,
+        }
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise HTTPException(status_code=504, detail="演练命令超时（30s）")
 
 
 @app.get("/metrics", response_class=PlainTextResponse)
