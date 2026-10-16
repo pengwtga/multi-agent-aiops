@@ -76,8 +76,20 @@ MOCK_SERVICE_TOPOLOGY = SHORTLINK_TOPOLOGY
 
 
 def _verify(promql: str, comparator: str = "gt", threshold: float = 0.0) -> dict:
-    """构造一个证据探针：用 PromQL 实测值证实或证伪某候选根因"""
-    return {"promql": promql, "comparator": comparator, "threshold": threshold}
+    """构造一个证据探针：用 PromQL 实测值证实或证伪某候选根因
+
+    统一包一层 `or vector(0)`：这些探针问的都是「有没有观测到 X」，
+    那么「序列不存在」应等价于「观测值为 0」（证伪），而不是「未知」。
+
+    实测踩过的坑：应用重启后若跳转从未成功过，`shortlink_redirect_total`
+    这个 Micrometer 计数器根本不会注册出序列，`rate()` 又因为窗口内不足
+    2 个采样点返回空——探针拿到 None 会让判据直接失效。
+    """
+    return {
+        "promql": f"({promql}) or vector(0)",
+        "comparator": comparator,
+        "threshold": threshold,
+    }
 
 
 # 短链平台故障模式库

@@ -15,10 +15,16 @@ from agents.rca_agent import RCAAgent
 from core.event_bus import InMemoryEventBus
 from models.events import AlertEvent, IncidentState, Severity
 
-PROBE_REDIS = 'sum(rate(shortlink_redirect_total{job="shortlink-app"}[2m]))'
-PROBE_MYSQL = 'sum(rate(hikaricp_connections_timeout_total{job="shortlink-app"}[2m]))'
-PROBE_TRAFFIC = 'sum(rate(http_server_requests_seconds_count{job="shortlink-app"}[2m]))'
-PROBE_THREADS = (
+# _verify() 会给探针统一包一层 "or vector(0)"，桩的 key 必须用包装后的形态，
+# 否则 RCAAgent 查不到值、探针退化成「无数据」。
+def probe(promql: str) -> str:
+    return f"({promql}) or vector(0)"
+
+
+PROBE_REDIS = probe('sum(rate(shortlink_redirect_total{job="shortlink-app"}[2m]))')
+PROBE_MYSQL = probe('sum(rate(hikaricp_connections_timeout_total{job="shortlink-app"}[2m]))')
+PROBE_TRAFFIC = probe('sum(rate(http_server_requests_seconds_count{job="shortlink-app"}[2m]))')
+PROBE_THREADS = probe(
     'sum(tomcat_threads_busy_threads{job="shortlink-app"})'
     ' / sum(tomcat_threads_config_max_threads{job="shortlink-app"})'
 )
