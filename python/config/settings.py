@@ -41,7 +41,9 @@ class Settings(BaseSettings):
     circuit_breaker_threshold: int = 5
     circuit_breaker_timeout: int = 60
     rate_limit_per_minute: int = 30
-    blast_radius_max_percent: float = 0.2
+    # 阶段 5：docker compose 部署下重启容器的爆炸半径天然大于 K8s 重启单个 Pod
+    # （重启 Redis 期间所有跳转失败），0.2 会把所有重启类动作都降级成人工，故放宽到 0.5
+    blast_radius_max_percent: float = 0.5
 
     model_config = {"env_prefix": "AIOPS_", "env_file": ".env"}
 

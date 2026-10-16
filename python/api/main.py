@@ -47,7 +47,10 @@ async def lifespan(app: FastAPI):
     await event_bus.start()
     # 阶段 4：RCA 回查 Prometheus 实测值以证实/证伪候选根因
     orchestrator = Orchestrator(
-        event_bus, evidence_provider=PrometheusClient(settings.prometheus_url)
+        event_bus,
+        evidence_provider=PrometheusClient(settings.prometheus_url),
+        heal_dry_run=settings.heal_dry_run,
+        heal_max_blast_radius=settings.blast_radius_max_percent,
     )
     knowledge_graph = create_demo_knowledge_graph()
 

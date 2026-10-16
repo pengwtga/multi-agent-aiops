@@ -41,21 +41,35 @@ class RiskScorer:
     - 服务关键度权重: 0.10
     """
 
+    # 阶段 5：换成短链平台真实动作的风险系数
+    # 只读诊断风险为 0；重启类按影响面递增；无运行时开关的动作风险最高
     OPERATION_RISK = {
-        "restart_pod": 0.2,
-        "scale_up": 0.15,
-        "rate_limit": 0.1,
-        "circuit_breaker": 0.1,
-        "rollback_config": 0.5,
-        "rollback": 0.6,
+        "check_dependency": 0.0,
+        "check_mysql": 0.0,
+        "check_t_consumer_offset": 0.0,
+        "restart_redis": 0.15,
+        "restart_container": 0.3,
+        "restart_consumer": 0.3,
+        "restart_mysql": 0.4,
+        "scale_app": 0.5,
         "heap_dump": 0.05,
+        # 应用无对应机制、只能人工的动作：统一按高风险计
+        "rate_limit": 0.6,
+        "block_ip": 0.6,
+        "circuit_breaker": 0.6,
+        "tune_threads": 0.6,
+        "rollback": 0.6,
+        "rollback_config": 0.5,
+        "review_change": 0.3,
+        "review_config": 0.3,
     }
 
     CRITICAL_SERVICES = {
-        "payment-service": 1.0,
-        "order-service": 0.9,
-        "user-service": 0.8,
-        "inventory-service": 0.7,
+        "mysql": 0.9,
+        "redis": 0.8,
+        "shortlink-app": 0.7,
+        "kafka": 0.6,
+        "click-consumer": 0.5,
     }
 
     def compute(
