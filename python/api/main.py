@@ -391,6 +391,10 @@ async def drill_inject(request: DrillRequest):
     # 必须在注入**之前**取短链码：等 Redis 停了就扫不到真实 code 了
     probe_code = None
     if request.action == "inject":
+        # 清空告警去重缓存：演练是人为注入的新故障事件，
+        # 不该被上一次告警的 5 分钟窗口抑制（否则「点了没反应」）
+        if orchestrator:
+            orchestrator.clear_monitor_fingerprints()
         probe_code = await _resolve_probe_code()
         logger.warning(f"[DRILL] 探测短链码: {probe_code or '(未拿到)'}")
 

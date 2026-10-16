@@ -230,6 +230,22 @@ class Orchestrator:
     def get_checkpoint(self, incident_id: str) -> Optional[IncidentState]:
         return self._checkpoints.get(incident_id)
 
+    def clear_monitor_fingerprints(self) -> None:
+        """清空 MonitorAgent 的告警去重缓存（供故障演练调用）
+
+        演练是人为注入的**新故障事件**。若距上次告警不足 5 分钟，
+        AlertFingerprint 会把它当成重复告警静默抑制 —— 表现就是
+        「第一次点有反应，紧接着再点没反应」。因此注入前先清空窗口。
+
+        这里用 duck typing 找 MonitorAgent，避免在编排器里多引一层 AgentType。
+        """
+        for node in self._nodes:
+            agent = getattr(node, "agent", None)
+            clearer = getattr(agent, "clear_alert_fingerprints", None)
+            if callable(clearer):
+                clearer()
+                return
+
     def get_workflow_status(self) -> list[dict[str, Any]]:
         return [
             {

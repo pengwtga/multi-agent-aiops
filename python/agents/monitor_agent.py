@@ -59,6 +59,15 @@ class AlertFingerprint:
         for k in expired:
             del self._recent[k]
 
+    def clear(self) -> None:
+        """清空去重窗口内的指纹记录
+
+        用于故障演练：演练是**人为主动注入的新故障事件**，不该被上一次
+        （演练或真实故障）的 5 分钟去重窗口抑制 —— 否则用户点「故障演练」
+        会毫无反应，误以为功能坏了。
+        """
+        self._recent.clear()
+
 
 class AnomalyDetector:
     """多算法异常检测器
@@ -124,6 +133,17 @@ class MonitorAgent(BaseAgent):
         self._detector = AnomalyDetector()
         self._history: dict[str, list[float]] = defaultdict(list)
         self._history_max_len = 1000
+
+    def clear_alert_fingerprints(self) -> None:
+        """清空告警去重缓存（供故障演练调用）
+
+        背景：AlertFingerprint 有 5 分钟去重窗口，同 fingerprint 的告警
+        在窗口内会被抑制。正常运行时这是对的（避免告警风暴），但故障
+        演练是**人为注入的新故障**，若距上次告警不足 5 分钟，会被静默
+        抑制 —— 表现就是「第一次点有反应，紧接着第二次没反应」。
+        """
+        self._fingerprint.clear()
+        logger.info("[MonitorAgent] 告警去重缓存已清空（故障演练）")
 
     async def process(self, state: IncidentState) -> IncidentState:
         """处理入站指标数据，检测异常并生成告警
