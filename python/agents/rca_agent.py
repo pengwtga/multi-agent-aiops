@@ -143,6 +143,53 @@ SHORTLINK_FAULT_PATTERNS: dict[str, list[dict[str, Any]]] = {
             "suggested_actions": ["rollback", "review_change"],
         },
     ],
+    # 依赖「挂起」故障（补 §4.7 的缺口）
+    #
+    # 与 dependency_down 的区别：连接被拒绝是「快速失败」，会产生 5xx；
+    # 挂起是「卡住不返回」，不产生任何状态码，因此状态码类规则全部失效。
+    # 这里只能用「连接是否堆积」这类占用信号来判。
+    "dependency_hang": [
+        {
+            "root_cause": (
+                "Redis 连接挂起：读路径阻塞在 Lettuce 连接池等待，"
+                "请求既不返回也不报错（无降级逻辑）"
+            ),
+            "evidence_pattern": "dependency_down",
+            "base_probability": 0.55,
+            # 一手信号：连接被占住不释放（挂起的直接后果）。
+            # 不用 5xx rate —— 挂起时它恒为 0，因为请求根本没完成。
+            "verify": _verify(
+                'sum(tomcat_connections_current_connections'
+                '{job="shortlink-app"})',
+                "gt", 20,
+            ),
+            "suggested_actions": ["restart_redis", "check_dependency"],
+        },
+        {
+            "root_cause": (
+                "MySQL 连接挂起：缓存 miss 回源阻塞（命中路径仍正常）"
+            ),
+            "evidence_pattern": "dependency_down",
+            "base_probability": 0.25,
+            "verify": _verify(
+                'sum(rate(hikaricp_connections_timeout_total'
+                '{job="shortlink-app"}[2m]))',
+                "gt", 0.0,
+            ),
+            "suggested_actions": ["restart_mysql", "check_dependency"],
+        },
+        {
+            "root_cause": "真实流量激增导致线程池打满（非依赖故障）",
+            "evidence_pattern": "request_rate_increase",
+            "base_probability": 0.20,
+            "verify": _verify(
+                'sum(rate(http_server_requests_seconds_count'
+                '{job="shortlink-app"}[2m]))',
+                "gt", 50.0,
+            ),
+            "suggested_actions": ["scale_app", "rate_limit"],
+        },
+    ],
     "shortlink_app_down": [
         {
             "root_cause": "应用进程崩溃（OOM：堆上限 512m，压测时非堆另占约 200m）",

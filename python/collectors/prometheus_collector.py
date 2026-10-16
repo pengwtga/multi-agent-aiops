@@ -85,11 +85,17 @@ def build_shortlink_rules(job: str = SHORTLINK_JOB) -> list[AlertRule]:
     """短链平台业务告警规则集
 
     - up==0: 抓取目标不可达（应用进程死亡/端口不通），最高优先级
-    - 5xx rate: Redis 挂掉时读路径立即抛 500（无降级逻辑），是本阶段
-      故障注入验证的核心检测路径
+    - 5xx rate: 跳转/创建路径的 5xx 速率
+      ⚠️ 曾经的**错误假设**：以为「Redis 挂掉时读路径立即抛 500」。
+         实测恰恰相反 —— 应用阻塞在 Lettuce 连接池等待，既不返回也不
+         报错（/actuator/health 20s 超时无响应）。这条规则因此抓不到
+         挂起类故障，见下方 dependency_hang 与 §4.7。
     - consume_lag: 基于 t_consumer_offset 真相源的短链自定义指标；
       若误用 broker LAG 会被假 lag 误告警（shortlink ARCHITECTURE §6.5）
     - 限流拒绝: 绝对速率 >1/s，避免流量空闲时比率类指标分母为零
+    - dependency_hang: **补 §4.7 的缺口**。请求挂住时不产生 5xx，
+      状态码类规则全部失效；此规则改用「连接堆积 + 成功吞吐归零」
+      这两个**占用类**信号来捕获挂起。
     """
     return [
         AlertRule(
@@ -134,6 +140,40 @@ def build_shortlink_rules(job: str = SHORTLINK_JOB) -> list[AlertRule]:
             target_service="shortlink-app",
             metric_name="ratelimit_reject_rate",
             description="限流拒绝持续高于 1/s（疑似单 IP 滥用或阈值配置有误）",
+        ),
+        AlertRule(
+            name="dependency_hang",
+            # 依赖「挂起」检测（补 §4.7 的缺口）
+            #
+            # 为什么需要它：请求挂住时**不返回、也不报错**，因此既不产生
+            # 5xx 也不计入 http_server_requests_seconds_count（后者只在请求
+            # 完成时递增）。于是所有状态码类规则都失效 —— 监控一片绿，
+            # 而 Tomcat 线程池正被慢慢占满。
+            #
+            # 判据：连接被占住不释放，同时成功跳转吞吐归零。
+            #   (连接数 > 20) and (成功跳转速率 < 0.05/s)
+            #
+            # 两个操作数都必须 or vector(0) 兜底：rate() 在窗口内不足 2 个
+            # 采样点时返回空，而挂起时 shortlink_redirect_total 可能压根没有
+            # 序列（从未成功过）。返回空会让 `and` 直接失效导致漏报 ——
+            # 这正是 rca_agent._verify() 踩过的同一个坑。
+            promql=(
+                f'((sum(tomcat_connections_current_connections'
+                f'{{job="{job}"}})) or vector(0)) > 20'
+                " and "
+                f'((sum(rate(shortlink_redirect_total'
+                f'{{job="{job}"}}[2m]))) or vector(0)) < 0.05'
+                " or vector(0)"
+            ),
+            comparator="gt",
+            threshold=0.5,
+            severity=Severity.CRITICAL,
+            target_service="shortlink-app",
+            metric_name="dependency_hang",
+            description=(
+                "请求堆积但成功跳转吞吐归零：依赖挂起，无 5xx 信号，"
+                "状态码类规则抓不到"
+            ),
         ),
     ]
 
