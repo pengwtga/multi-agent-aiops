@@ -317,20 +317,24 @@ function renderCards(state){
     el.innerHTML = '<div class="empty">暂无事件记录。点击「立即巡检」生成一次完整工作流。</div>';
     return;
   }
+  // 字段名必须与 _serialize_* 的输出对齐。
+  // 此前读的是 alert_name / metric_name / metric_value / action_type /
+  // heal_level / execution_result / approval_status —— 那是**原始 Agent 对象**
+  // 的字段名；而 API 返回的是 _serialize_* 简化后的 name / metric / value /
+  // action / level / result / status。对不上，卡片就全落成「—」。
   var a = inc.alert || {}, r = inc.rca || {},
-      h = inc.heal || {}, c = inc.change || {}, p = h.action_params || {};
+      h = inc.heal || {}, c = inc.change || {};
   el.innerHTML = ''
-    + card('告警', a.alert_name || a.metric_name || '—',
-        (a.severity || '') + (a.metric_value !== undefined ? ' · 实测 ' + a.metric_value : ''))
+    + card('告警', a.name || a.metric || '—',
+        (a.severity || '') + (a.value !== undefined ? ' · 实测 ' + a.value : ''))
     + card('根因', r.root_cause || '—',
         r.confidence !== undefined ? '置信度 ' + r.confidence : '')
-    + card('动作', h.action_type || '—',
-        (h.heal_level ? h.heal_level + ' · ' : '')
-        + (h.blast_radius !== undefined ? '爆炸半径 ' + h.blast_radius + ' · ' : '')
-        + (p.container || p.target_service || ''))
-    + card('审批', c.approval_status || '—',
+    + card('动作', h.action || '—',
+        (h.level ? h.level + ' · ' : '')
+        + (h.blast_radius !== undefined ? '爆炸半径 ' + h.blast_radius : ''))
+    + card('审批', c.status || '—',
         (c.risk_score !== undefined ? '风险 ' + c.risk_score + ' · ' : '') + (c.approver || ''))
-    + card('执行', h.execution_result || '未执行', h.status || inc.status || '');
+    + card('执行', h.result || '未执行', inc.status || '');
 }
 
 function renderHistory(state){
@@ -343,9 +347,9 @@ function renderHistory(state){
     html += '<tr>'
       + '<td class="mono">' + esc(String(it.created_at || '').replace('T',' ').slice(0,19)) + '</td>'
       + '<td>' + esc(it.status || '') + '</td>'
-      + '<td>' + esc((it.alert || {}).alert_name || '—') + '</td>'
+      + '<td>' + esc((it.alert || {}).name || '—') + '</td>'
       + '<td>' + esc(r.root_cause || '—') + '</td>'
-      + '<td>' + esc(h.action_type || '—') + '</td></tr>';
+      + '<td>' + esc(h.action || '—') + '</td></tr>';
   }
   el.innerHTML = html + '</tbody></table>';
 }

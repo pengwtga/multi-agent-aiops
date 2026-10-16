@@ -246,6 +246,17 @@ class Orchestrator:
                 clearer()
                 return
 
+    def reset_workflow(self) -> None:
+        """把流水线所有节点重置为 pending
+
+        供故障演练调用：每次演练都是一轮**全新**的闭环，点下去时应该先把
+        上次的流水线清空。否则旧结果会一直挂在页面上，和新一轮的进度混
+        在一起，看不出这次到底跑到哪一步了。
+        """
+        for node in self._nodes:
+            node.status = NodeStatus.PENDING
+            node.retry_count = 0
+
     def get_workflow_status(self) -> list[dict[str, Any]]:
         return [
             {

@@ -12,7 +12,7 @@ import asyncio
 import contextlib
 import logging
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
@@ -120,6 +120,18 @@ async def root():
     }
 
 
+def _to_local(ts: datetime) -> str:
+    """把 UTC 时间转成本地时间再下发
+
+    IncidentState.created_at 来自 datetime.utcnow()，是**不带时区标记的
+    UTC**。直接发给前端显示，会比日志里的系统时间早 8 小时
+    （UTC+8），看着像事件「提前发生了」，和日志对不上。
+    """
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone().isoformat()
+
+
 def _snapshot_incident(state, workflow=None) -> dict:
     """把一次工作流结果序列化成事件记录
 
@@ -134,6 +146,8 @@ def _snapshot_incident(state, workflow=None) -> dict:
     return {
         "incident_id": state.incident_id,
         "status": state.status,
+        # 历史事件表要展示时间列，缺这个字段那一列就是空的
+        "created_at": _to_local(state.created_at),
         "alert": _serialize_alert(state),
         "rca": _serialize_rca(state),
         "heal": _serialize_heal(state),
@@ -412,10 +426,14 @@ async def drill_inject(request: DrillRequest):
     # 必须在注入**之前**取短链码：等 Redis 停了就扫不到真实 code 了
     probe_code = None
     if request.action == "inject":
-        # 清空告警去重缓存：演练是人为注入的新故障事件，
-        # 不该被上一次告警的 5 分钟窗口抑制（否则「点了没反应」）
         if orchestrator:
+            # 每次演练都是一轮全新闭环：先清空上一次的流水线与事件历史，
+            # 否则旧结果会和新进度混在一起，看不出这次跑到哪一步
+            orchestrator.reset_workflow()
+            # 清空告警去重缓存：演练是人为注入的新故障事件，
+            # 不该被上一次告警的 5 分钟窗口抑制（否则「点了没反应」）
             orchestrator.clear_monitor_fingerprints()
+        incident_history.clear()
         probe_code = await _resolve_probe_code()
         logger.warning(f"[DRILL] 探测短链码: {probe_code or '(未拿到)'}")
 
