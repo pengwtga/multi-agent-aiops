@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from fastapi import APIRouter
@@ -66,6 +67,23 @@ def _style(status: Optional[str]) -> tuple[str, str]:
     if not status:
         return DEFAULT_STYLE
     return STATUS_STYLE.get(str(status).lower(), DEFAULT_STYLE)
+
+
+def _fmt_duration(ms: Optional[float]) -> str:
+    """把毫秒格式化成易读文本
+
+    小于 1 秒用毫秒（"18ms"），否则用秒（"5.61s"）—— 自愈执行要跑
+    好几秒，监控只有几十毫秒，量级差太多，统一单位反而不好读。
+    """
+    if ms is None:
+        return "—"
+    try:
+        value = float(ms)
+    except (TypeError, ValueError):
+        return "—"
+    if value < 1000:
+        return f"{value:.0f}ms"
+    return f"{value / 1000:.2f}s"
 
 
 def build_state(
@@ -119,6 +137,25 @@ def build_state(
         w.get("name"): w for w in (wf_source or workflow or [])
     }
 
+    def _parse_ts(ts: Optional[str]) -> Optional[datetime]:
+        """解析节点时间戳；均为 utcnow().isoformat()，无时区标记"""
+        if not ts:
+            return None
+        try:
+            dt = datetime.fromisoformat(ts)
+        except Exception:
+            return None
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+    started = [
+        t for t in (_parse_ts(w.get("started_at")) for w in wf_by_name.values())
+        if t is not None
+    ]
+    ended = [
+        t for t in (_parse_ts(w.get("ended_at")) for w in wf_by_name.values())
+        if t is not None
+    ]
+
     pipeline: list[dict[str, Any]] = []
     for idx, (key, label, agent) in enumerate(PIPELINE):
         wf = wf_by_name.get(key) or {}
@@ -136,6 +173,8 @@ def build_state(
                 "status_text": text,
                 "color": color,
                 "retry_count": wf.get("retry_count", 0),
+                "duration_ms": wf.get("duration_ms"),
+                "duration_text": _fmt_duration(wf.get("duration_ms")),
             }
         )
 
@@ -146,9 +185,23 @@ def build_state(
             "alerts": len((monitor_status or {}).get("alerts_fired") or []),
         },
         "pipeline": pipeline,
-        "latest": latest,
+        "latest": (
+            dict(latest, duration_text=_fmt_duration(latest.get("duration_ms")))
+            if latest
+            else None
+        ),
+        # 端到端耗时：首节点（监控告警）开始 → 末节点（自愈执行）结束。
+        # 不是各节点耗时累加——那样会漏掉节点间的调度与 I/O 间隔。
+        "duration_text": _fmt_duration(
+            round((max(ended) - min(started)).total_seconds() * 1000, 1)
+            if started and ended
+            else None
+        ),
         "total_incidents": (incidents or {}).get("total", 0),
-        "history": incs[-10:][::-1],
+        "history": [
+            dict(it, duration_text=_fmt_duration(it.get("duration_ms")))
+            for it in incs[-10:][::-1]
+        ],
         "drill_enabled": drill_enabled,
     }
 
@@ -198,6 +251,7 @@ DASHBOARD_HTML = """
   .node .label { font-size: 13px; font-weight: 500; }
   .node .agent { font-size: 11px; color: var(--muted); }
   .node .st { font-size: 11px; margin-top: 4px; }
+  .node .dur { font-size: 11px; margin-top: 2px; color: #64748b; }
   .conn { flex: 0 0 26px; align-self: center; height: 2px; background: var(--border);
           position: relative; top: -6px; }
   .conn.done { background: #10b981; }
@@ -299,6 +353,7 @@ function renderPipeline(state){
       + '<div class="label">' + esc(n.label) + '</div>'
       + '<div class="agent">' + esc(n.agent) + '</div>'
       + '<div class="st" style="color:' + s[1] + '">' + esc(s[0]) + '</div>'
+      + '<div class="dur">' + esc(n.duration_text) + '</div>'
       + '</div>';
   }
   document.getElementById('pipeline').innerHTML = html;
@@ -341,7 +396,7 @@ function renderHistory(state){
   var incs = state.history || [], el = document.getElementById('history');
   if(!incs.length){ el.innerHTML = '<div class="empty">暂无历史事件</div>'; return; }
   var html = '<table><thead><tr><th>时间</th><th>状态</th>'
-    + '<th>告警</th><th>根因</th><th>动作</th></tr></thead><tbody>';
+    + '<th>告警</th><th>根因</th><th>动作</th><th>闭环耗时</th></tr></thead><tbody>';
   for(var i=0;i<incs.length;i++){
     var it = incs[i], r = it.rca || {}, h = it.heal || {};
     html += '<tr>'
@@ -349,7 +404,8 @@ function renderHistory(state){
       + '<td>' + esc(it.status || '') + '</td>'
       + '<td>' + esc((it.alert || {}).name || '—') + '</td>'
       + '<td>' + esc(r.root_cause || '—') + '</td>'
-      + '<td>' + esc(h.action || '—') + '</td></tr>';
+      + '<td>' + esc(h.action || '—') + '</td>'
+      + '<td class="mono">' + esc(it.duration_text) + '</td></tr>';
   }
   el.innerHTML = html + '</tbody></table>';
 }

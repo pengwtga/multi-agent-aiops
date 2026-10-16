@@ -239,11 +239,24 @@ class MonitorLoop:
                 logger.exception("[MonitorLoop] cycle failed")
             await asyncio.sleep(self._interval)
 
+    def _emit_incident(self, state) -> None:
+        """把一次「有告警」的闭环回写到事件历史
+
+        命中告警时**立即**调用，而不是攒到循环末尾统一回写：
+
+        1) 一轮里可能命中多个规则（规则层 + 基线层各跑一遍）。此前只把
+           last_state 留给最后一个，前面的告警就被覆盖了 —— 这正是
+           「告警有 2 个、历史事件却只展示 1 个」的原因。
+        2) 节点状态是**全局共享**的，等循环跑完再取快照，会被后续无告警
+           的轮次覆盖成 SKIPPED，把刚跑完的自愈结果冲掉。
+        """
+        if self._on_cycle is None:
+            return
+        with contextlib.suppress(Exception):
+            self._on_cycle(state, self._orchestrator.get_workflow_status())
+
     async def _run_cycle(self) -> None:
         self.cycles += 1
-        # 本轮「有告警」的 incident 及其节点快照，供回写钩子使用
-        last_state: Optional[Any] = None
-        last_snapshot: Optional[list[dict[str, Any]]] = None
 
         # ---- 1. 静态业务规则 ----
         for rule in self._rules:
@@ -268,10 +281,7 @@ class MonitorLoop:
             }
             state = await self._orchestrator.run(metadata=metadata)
             if state.alert_event is not None:
-                last_state = state
-                # 立刻取节点快照：此刻的状态才是本次闭环的真实结果。
-                # 若等循环跑完再取，会被后续无告警的轮次覆盖成 SKIPPED。
-                last_snapshot = self._orchestrator.get_workflow_status()
+                self._emit_incident(state)
             if state.alert_event:
                 logger.info(
                     f"[MonitorLoop] 规则命中: {rule.name} "
@@ -293,20 +303,9 @@ class MonitorLoop:
                 },
             })
             if state.alert_event is not None:
-                last_state = state
-                last_snapshot = self._orchestrator.get_workflow_status()
+                self._emit_incident(state)
             # 统计层捕获的是「未知突变」，同样要进自观测列表，否则状态端点是瞎的
             self._record_alert(state, source="statistical")
-
-        # 回写本轮结果到事件历史
-        #
-        # 为什么要补：此前监控循环跑出的闭环**从不写入** incident_history
-        # （只有手动触发端点会写），于是 /api/v1/incidents 恒为 0 条，
-        # Dashboard 判断「最近是否有告警」时永远读到空 → 流水线一直显示
-        # 空闲态。表现就是：故障演练明明跑完了闭环，页面上却毫无反应。
-        if last_state is not None and self._on_cycle is not None:
-            with contextlib.suppress(Exception):
-                self._on_cycle(last_state, last_snapshot)
 
     def _record_alert(self, state, source: str) -> None:
         """记录一次告警到自观测列表（规则层与统计层共用）"""

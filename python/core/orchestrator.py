@@ -75,6 +75,13 @@ class WorkflowNode:
         self.max_retries = max_retries
         self.status = NodeStatus.PENDING
         self.retry_count = 0
+        # 本次执行的开始/结束时刻与耗时（毫秒），供 Dashboard 展示节点运行时间。
+        # 这是「本次闭环」的值：每次 run() 覆盖，reset_workflow() 清空。
+        # 之所以要单独记，是因为 agent.get_metrics() 里的 avg_latency_ms
+        # 是**跨所有历史调用**的累计均值，无法反映这一次的耗时。
+        self.started_at: Optional[datetime] = None
+        self.ended_at: Optional[datetime] = None
+        self.duration_ms: float = 0.0
 
     def should_execute(self, state: IncidentState) -> bool:
         if self.condition is None:
@@ -182,6 +189,9 @@ class Orchestrator:
                 continue
 
             node.status = NodeStatus.RUNNING
+            node.started_at = datetime.utcnow()
+            node.ended_at = None
+            node.duration_ms = 0.0
             success = False
 
             while node.retry_count <= node.max_retries:
@@ -213,6 +223,13 @@ class Orchestrator:
             if not success:
                 node.status = NodeStatus.FAILED
                 logger.error(f"[Orchestrator] Node {node.name} failed after {node.max_retries} retries")
+
+            node.ended_at = datetime.utcnow()
+            node.duration_ms = (
+                (node.ended_at - node.started_at).total_seconds() * 1000
+                if node.started_at
+                else 0.0
+            )
 
             self._save_checkpoint(state)
 
@@ -256,6 +273,9 @@ class Orchestrator:
         for node in self._nodes:
             node.status = NodeStatus.PENDING
             node.retry_count = 0
+            node.started_at = None
+            node.ended_at = None
+            node.duration_ms = 0.0
 
     def get_workflow_status(self) -> list[dict[str, Any]]:
         return [
@@ -264,6 +284,11 @@ class Orchestrator:
                 "status": node.status.value,
                 "agent_type": node.agent.agent_type.value,
                 "retry_count": node.retry_count,
+                "duration_ms": round(node.duration_ms, 1),
+                "started_at": (
+                    node.started_at.isoformat() if node.started_at else None
+                ),
+                "ended_at": node.ended_at.isoformat() if node.ended_at else None,
                 "metrics": node.agent.get_metrics(),
             }
             for node in self._nodes

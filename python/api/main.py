@@ -132,6 +132,31 @@ def _to_local(ts: datetime) -> str:
     return ts.astimezone().isoformat()
 
 
+def _pipeline_duration_ms(workflow) -> Optional[float]:
+    """流水线端到端耗时（毫秒）：首节点开始 → 末节点结束
+
+    用首尾时间戳相减，而不是把各节点 duration_ms 累加 ——
+    后者会漏掉节点之间的调度与 I/O 间隔，不是用户感知的真实耗时。
+    """
+    if not workflow:
+        return None
+    started = [w["started_at"] for w in workflow if w.get("started_at")]
+    ended = [w["ended_at"] for w in workflow if w.get("ended_at")]
+    if not started or not ended:
+        return None
+    try:
+        # 均为 utcnow().isoformat()，同一时区、字典序即时间序，可直接比较
+        s = datetime.fromisoformat(min(started))
+        e = datetime.fromisoformat(max(ended))
+    except Exception:
+        return None
+    if s.tzinfo is None:
+        s = s.replace(tzinfo=timezone.utc)
+    if e.tzinfo is None:
+        e = e.replace(tzinfo=timezone.utc)
+    return round((e - s).total_seconds() * 1000, 1)
+
+
 def _snapshot_incident(state, workflow=None) -> dict:
     """把一次工作流结果序列化成事件记录
 
@@ -143,6 +168,9 @@ def _snapshot_incident(state, workflow=None) -> dict:
               最后一次往往是无告警的（会把后续节点置为 SKIPPED），
               因此必须传命中告警当次的快照，否则会把自愈结果冲掉。
     """
+    wf = workflow if workflow is not None else (
+        orchestrator.get_workflow_status() if orchestrator else []
+    )
     return {
         "incident_id": state.incident_id,
         "status": state.status,
@@ -152,9 +180,9 @@ def _snapshot_incident(state, workflow=None) -> dict:
         "rca": _serialize_rca(state),
         "heal": _serialize_heal(state),
         "change": _serialize_change(state),
-        "workflow": workflow if workflow is not None else (
-            orchestrator.get_workflow_status() if orchestrator else []
-        ),
+        "workflow": wf,
+        # 端到端耗时：从监控告警开始到自愈执行完
+        "duration_ms": _pipeline_duration_ms(wf),
     }
 
 
