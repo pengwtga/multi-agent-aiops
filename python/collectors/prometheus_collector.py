@@ -16,11 +16,12 @@
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
@@ -207,6 +208,7 @@ class MonitorLoop:
         prometheus_url: str = "http://localhost:9090",
         interval_seconds: int = 30,
         rules: Optional[list[AlertRule]] = None,
+        on_cycle: Optional[Callable[[Any], None]] = None,
     ):
         self._orchestrator = orchestrator
         self._client = PrometheusClient(prometheus_url)
@@ -216,6 +218,8 @@ class MonitorLoop:
         # 自观测计数
         self.cycles = 0
         self.alerts_fired: list[dict[str, Any]] = []
+        # 每轮跑完的回写钩子（把 incident 交给 API 层的事件历史）
+        self._on_cycle = on_cycle
 
     def stop(self) -> None:
         self._running = False
@@ -237,6 +241,9 @@ class MonitorLoop:
 
     async def _run_cycle(self) -> None:
         self.cycles += 1
+        # 本轮「有告警」的 incident 及其节点快照，供回写钩子使用
+        last_state: Optional[Any] = None
+        last_snapshot: Optional[list[dict[str, Any]]] = None
 
         # ---- 1. 静态业务规则 ----
         for rule in self._rules:
@@ -260,6 +267,11 @@ class MonitorLoop:
                 },
             }
             state = await self._orchestrator.run(metadata=metadata)
+            if state.alert_event is not None:
+                last_state = state
+                # 立刻取节点快照：此刻的状态才是本次闭环的真实结果。
+                # 若等循环跑完再取，会被后续无告警的轮次覆盖成 SKIPPED。
+                last_snapshot = self._orchestrator.get_workflow_status()
             if state.alert_event:
                 logger.info(
                     f"[MonitorLoop] 规则命中: {rule.name} "
@@ -280,8 +292,21 @@ class MonitorLoop:
                     "labels": {"job": SHORTLINK_JOB},
                 },
             })
+            if state.alert_event is not None:
+                last_state = state
+                last_snapshot = self._orchestrator.get_workflow_status()
             # 统计层捕获的是「未知突变」，同样要进自观测列表，否则状态端点是瞎的
             self._record_alert(state, source="statistical")
+
+        # 回写本轮结果到事件历史
+        #
+        # 为什么要补：此前监控循环跑出的闭环**从不写入** incident_history
+        # （只有手动触发端点会写），于是 /api/v1/incidents 恒为 0 条，
+        # Dashboard 判断「最近是否有告警」时永远读到空 → 流水线一直显示
+        # 空闲态。表现就是：故障演练明明跑完了闭环，页面上却毫无反应。
+        if last_state is not None and self._on_cycle is not None:
+            with contextlib.suppress(Exception):
+                self._on_cycle(last_state, last_snapshot)
 
     def _record_alert(self, state, source: str) -> None:
         """记录一次告警到自观测列表（规则层与统计层共用）"""

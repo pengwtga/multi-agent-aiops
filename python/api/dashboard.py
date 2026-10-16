@@ -86,18 +86,38 @@ def build_state(
     incs = (incidents or {}).get("incidents") or []
     latest = incs[-1] if incs else None
 
-    # get_workflow_status() 返回 list，先按 name 建索引，前端直接渲染
-    wf_by_name: dict[str, dict[str, Any]] = {
-        w.get("name"): w for w in (workflow or [])
-    }
-
-    # 最近一轮是否真的触发了告警（status=open 表示本轮无异常）
+    # 最近一次**有告警**的闭环（而非最新一条）
     #
-    # 为什么要区分：get_workflow_status() 返回的是**全局累积**的节点状态，
-    # 一旦某轮跑过就留下来了。直接下发给前端，用户打开页面会看到
-    # 「监控告警=已完成、根因分析=已跳过…」，看起来像「刚自愈过一轮」，
-    # 实际含义却是「本轮监控正常、没发现异常」，非常误导。
-    has_alert = bool(latest and (latest.get("status") or "open") != "open")
+    # 两层原因：
+    #
+    # 1) 语义：get_workflow_status() 返回的是**全局累积**的节点状态，一旦
+    #    某轮跑过就留下来了。直接下发给前端，用户打开页面会看到
+    #    「监控告警=已完成、根因分析=已跳过…」，看着像「刚自愈过一轮」，
+    #    实际含义却是「本轮监控正常、没发现异常」，非常误导。
+    #
+    # 2) 时序：不能只看 incs[-1]。监控循环每 30s 一轮，自愈跑完后下一轮
+    #    就没告警了（新 incident 是 open）。若据此把流水线重置为
+    #    「待触发」，用户刚看到的闭环结果会在 30 秒后凭空消失 ——
+    #    表现正是「点了没反应」。
+    #
+    # 因此从后往前找第一个「有告警」的 incident：找到就展示闭环的真实
+    # 进度；从未有过告警则整条流水线显示空闲态。
+    active = None
+    for inc in reversed(incs):
+        if (inc.get("status") or "open") != "open":
+            active = inc
+            break
+    has_alert = active is not None
+
+    # 优先用闭环当次记录的节点快照，而不是 orchestrator 的当前状态。
+    #
+    # 为什么：节点状态是**全局共享**的。自愈跑完后，监控循环下一轮若无告警，
+    # 会把 rca 之后的节点重新置为 SKIPPED，把刚跑完的闭环结果冲掉 ——
+    # 页面上就只剩「已完成 + 已跳过」，看着像自愈没跑到底。
+    wf_source = (active or {}).get("workflow") if has_alert else None
+    wf_by_name: dict[str, dict[str, Any]] = {
+        w.get("name"): w for w in (wf_source or workflow or [])
+    }
 
     pipeline: list[dict[str, Any]] = []
     for idx, (key, label, agent) in enumerate(PIPELINE):

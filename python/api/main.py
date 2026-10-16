@@ -64,6 +64,12 @@ async def lifespan(app: FastAPI):
             orchestrator,
             prometheus_url=settings.prometheus_url,
             interval_seconds=settings.monitor_check_interval,
+            # 把监控循环跑出的闭环回写到事件历史。
+            # 此前监控循环从不回写，导致事件列表恒为 0 条、
+            # Dashboard 流水线永远显示空闲态（「点了没反应」的真因）。
+            on_cycle=lambda st, snap: incident_history.append(
+                _snapshot_incident(st, snap)
+            ),
         )
         monitor_task = asyncio.create_task(monitor_loop.run_forever())
 
@@ -114,6 +120,30 @@ async def root():
     }
 
 
+def _snapshot_incident(state, workflow=None) -> dict:
+    """把一次工作流结果序列化成事件记录
+
+    手动触发端点与监控循环共用。此前监控循环跑出的闭环**从不写入**
+    incident_history，导致 /api/v1/incidents 恒为 0 条、Dashboard
+    流水线永远显示空闲态（表现为「点了故障演练毫无反应」）。
+
+    workflow: 闭环当次的节点状态快照。监控循环每轮会跑多次工作流，
+              最后一次往往是无告警的（会把后续节点置为 SKIPPED），
+              因此必须传命中告警当次的快照，否则会把自愈结果冲掉。
+    """
+    return {
+        "incident_id": state.incident_id,
+        "status": state.status,
+        "alert": _serialize_alert(state),
+        "rca": _serialize_rca(state),
+        "heal": _serialize_heal(state),
+        "change": _serialize_change(state),
+        "workflow": workflow if workflow is not None else (
+            orchestrator.get_workflow_status() if orchestrator else []
+        ),
+    }
+
+
 @app.post("/api/v1/incidents/trigger")
 async def trigger_incident(request: TriggerRequest):
     """触发一次完整的故障处理工作流"""
@@ -128,16 +158,7 @@ async def trigger_incident(request: TriggerRequest):
 
     state = await orchestrator.run(metadata=metadata)
 
-    result = {
-        "incident_id": state.incident_id,
-        "status": state.status,
-        "alert": _serialize_alert(state),
-        "rca": _serialize_rca(state),
-        "heal": _serialize_heal(state),
-        "change": _serialize_change(state),
-        "workflow": orchestrator.get_workflow_status(),
-    }
-
+    result = _snapshot_incident(state)
     incident_history.append(result)
     return result
 
