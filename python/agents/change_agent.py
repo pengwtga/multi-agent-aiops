@@ -199,7 +199,11 @@ class ChangeAgent(BaseAgent):
         state.change_event = change_event
 
         if approval_status == "approved":
-            state.status = "resolved"
+            # 审批通过 ≠ 已修复。真正的执行由 HealExecuteAgent 完成，
+            # 只有执行并通过执行后验证才会置为 resolved。
+            # 原实现在这里直接置 resolved，于是「审批通过」被当成「修复完成」——
+            # 而那时根本没有任何执行动作发生过。
+            state.status = "approved"
         else:
             state.status = "pending_approval"
 

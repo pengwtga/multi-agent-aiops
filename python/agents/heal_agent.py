@@ -1,9 +1,9 @@
-"""故障自愈 Agent — 修复方案匹配 + 安全执行 + 执行后验证
+"""故障自愈 Agent — 修复方案匹配 + 审批闸门 + 执行 + 执行后验证
 
 核心功能：
 1. 根据 RCA 结果匹配最佳修复方案
 2. 分级自愈策略：L0（全自动）/ L1（半自动）/ L2（人工）
-3. 安全护栏：dry-run 校验 → 爆炸半径评估 → 熔断器检查 → 执行 → 执行后验证
+3. 安全护栏：dry-run 校验 → 爆炸半径评估 → 熔断器检查 → **审批通过** → 执行 → 执行后验证
 4. 执行后验证：重启类动作确认容器回到 healthy
 
 面试重点：
@@ -17,7 +17,19 @@
 - 新增 DockerExecutor：真实执行，带命令白名单、超时、无 shell（杜绝注入）
 - 执行后验证：重启类动作后用 docker inspect 确认容器回到 healthy
 
-**分级原则（重要）**：只有「幂等 + 可验证 + 影响可控」的动作才允许 L0 自动执行。
+**为什么拆成两个 Agent（重要）**：
+原实现是 Heal → Change 串行，HealAgent 自己就执行了，ChangeAgent 事后补一条
+「审批通过」——审批不是闸门，而是橡皮图章。现在拆成：
+
+    HealProposeAgent（只提议，绝不执行）
+        ↓
+    ChangeAgent（风险评分 + 审批）← 真正的闸门
+        ↓
+    HealExecuteAgent（仅审批通过且 L0 才执行）
+
+事件流也随之分开：提议发 `aiops.events`，只有真正要执行的命令才发 `aiops.commands`。
+
+**分级原则**：只有「幂等 + 可验证 + 影响可控」的动作才允许 L0 自动执行。
 短链应用本身不提供运行时开关的动作（限流阈值、熔断、IP 黑名单、线程池参数）
 一律标 L2 人工 —— 宁可只提建议，也不伪造一个执行结果。
 """
@@ -123,7 +135,7 @@ SHORTLINK_PLAYBOOKS: dict[str, dict[str, Any]] = {
          "SELECT partition_id, topic_offset FROM t_consumer_offset"],
     ),
 
-    # ---- 半自动（L1）：影响较大，需人确认 ----
+    # ---- 半自动（L1）：影响较大，审批通过后仍需人确认 ----
     "restart_container": {
         "level": HealLevel.L1_SEMI,
         "description": "重启短链应用容器（会中断在途请求）",
@@ -146,7 +158,7 @@ SHORTLINK_PLAYBOOKS: dict[str, dict[str, Any]] = {
     },
     "restart_mysql": {
         "level": HealLevel.L1_SEMI,
-        "description": "重启 MySQL 容器（影响写入，需确认）",
+        "description": "重启 MySQL 容器（影响写入）",
         "argv_template": ["docker", "restart", "{container}"],
         "target_container": SHORTLINK_CONTAINERS["mysql"],
         "estimated_duration_sec": 60,
@@ -321,96 +333,106 @@ class CircuitBreaker:
         return self._state
 
 
-class HealAgent(BaseAgent):
-    """故障自愈 Agent"""
+def _select_best_action(suggested_actions: list[str]) -> str:
+    """选择修复方案
+
+    尊重 RCA 的排序：suggested_actions 是有序的（首选动作在前），
+    取第一个本系统有 playbook 的动作。原实现用固定的全局优先级，
+    会忽略 RCA 的判断（曾把 Redis 故障选成 rate_limit）。
+    """
+    for action in suggested_actions or []:
+        if action in SHORTLINK_PLAYBOOKS:
+            return action
+    # RCA 给的动作一个都没有 playbook → 退回只读诊断，至少产出真实信息
+    return "check_dependency"
+
+
+def _render_argv(playbook: dict[str, Any]) -> Optional[list[str]]:
+    """渲染命令 argv；playbook 不可执行时返回 None"""
+    template = playbook.get("argv_template")
+    if not template:
+        return None
+    container = playbook.get("target_container") or ""
+    return [part.replace("{container}", container) for part in template]
+
+
+def _resolve_level(playbook: dict[str, Any], max_blast_radius: float) -> tuple[HealLevel, float]:
+    """按爆炸半径决定最终级别：超阈值降级为人工"""
+    blast_radius = playbook["blast_radius_factor"]
+    level = playbook["level"]
+    if blast_radius > max_blast_radius:
+        logger.warning(
+            f"[HealAgent] Blast radius {blast_radius} exceeds "
+            f"max {max_blast_radius} → 降级为人工"
+        )
+        level = HealLevel.L2_MANUAL
+    return level, blast_radius
+
+
+class HealProposeAgent(BaseAgent):
+    """自愈提议 Agent —— 匹配方案、分级、dry-run 校验，**但绝不执行**
+
+    执行由 HealExecuteAgent 在 ChangeAgent 审批通过之后进行。
+    """
 
     def __init__(
         self,
         event_bus: EventBus,
-        dry_run: bool = True,
         max_blast_radius: float = 0.5,
+        circuit_breaker: Optional[CircuitBreaker] = None,
         executor: Optional[DockerExecutor] = None,
     ):
-        super().__init__(AgentType.HEAL, event_bus, "HealAgent")
-        # dry_run=True 时只校验命令、不执行（安全默认）
-        self._dry_run = dry_run
+        super().__init__(AgentType.HEAL, event_bus, "HealProposeAgent")
         self._max_blast_radius = max_blast_radius
-        self._circuit_breaker = CircuitBreaker()
+        self._circuit_breaker = circuit_breaker or CircuitBreaker()
         self._executor = executor or DockerExecutor()
 
     async def process(self, state: IncidentState) -> IncidentState:
         rca = state.rca_event
         if not rca:
-            logger.warning("[HealAgent] No RCA result to act on")
+            logger.warning("[HealProposeAgent] No RCA result to act on")
             return state
 
         if not self._circuit_breaker.allow_request():
-            logger.warning("[HealAgent] Circuit breaker OPEN, skipping auto-heal")
+            logger.warning("[HealProposeAgent] Circuit breaker OPEN, skipping auto-heal")
             state.error_message = "Circuit breaker is open, auto-heal suspended"
             return state
 
-        action_type = self._select_best_action(rca.suggested_actions)
+        action_type = _select_best_action(rca.suggested_actions)
         playbook = SHORTLINK_PLAYBOOKS.get(action_type)
         if not playbook:
-            logger.warning(f"[HealAgent] No playbook for action: {action_type}")
+            logger.warning(f"[HealProposeAgent] No playbook for action: {action_type}")
             return state
 
-        blast_radius = playbook["blast_radius_factor"]
-        playbook_level = playbook["level"]
-        if blast_radius > self._max_blast_radius:
-            logger.warning(
-                f"[HealAgent] Blast radius {blast_radius} exceeds "
-                f"max {self._max_blast_radius} → 降级为人工"
-            )
-            playbook_level = HealLevel.L2_MANUAL
-
-        argv = self._render_argv(playbook)
-        dry_run_result = None
-        execution_result = None
-        event_type = EventType.HEAL_PROPOSED
+        playbook_level, blast_radius = _resolve_level(playbook, self._max_blast_radius)
+        argv = _render_argv(playbook)
 
         if argv is None:
             # 本系统没有能力执行 → 明确说明理由，不伪造执行
-            dry_run_result = f"本系统不执行该动作，需人工：{playbook.get('manual_reason', '无对应执行能力')}"
-            logger.info(f"[HealAgent] 需人工处理: {action_type} — {playbook['description']}")
+            dry_run_result = (
+                f"本系统不执行该动作，需人工："
+                f"{playbook.get('manual_reason', '无对应执行能力')}"
+            )
         else:
             dry_ok, dry_msg = self._executor.validate(argv)
-            dry_run_result = f"DRY-RUN {'OK' if dry_ok else 'REJECTED'}: {' '.join(argv)} — {dry_msg}"
-            logger.info(f"[HealAgent] DRY-RUN: {' '.join(argv)}")
-
-            if dry_ok and playbook_level == HealLevel.L0_AUTO and not self._dry_run:
-                ok, out = await self._executor.run(
-                    argv, timeout_sec=playbook.get("estimated_duration_sec", 60) * 3
-                )
-                execution_result = f"{'SUCCESS' if ok else 'FAILED'}: {out}"
-
-                verify_container = playbook.get("verify_container")
-                if ok and verify_container:
-                    v_ok, v_out = await self._executor.verify_healthy(verify_container)
-                    execution_result += f" | 执行后验证: {v_out}"
-                    ok = v_ok
-
-                logger.info(f"[HealAgent] 执行结果: {execution_result}")
-
-                if ok:
-                    self._circuit_breaker.record_success()
-                    event_type = EventType.HEAL_COMPLETED
-                else:
-                    self._circuit_breaker.record_failure()
-                    event_type = EventType.HEAL_FAILED
-            elif dry_ok and playbook_level == HealLevel.L0_AUTO and self._dry_run:
-                execution_result = "未执行：dry_run 模式（AIOPS_HEAL_DRY_RUN=false 可开启真实执行）"
+            dry_run_result = (
+                f"DRY-RUN {'OK' if dry_ok else 'REJECTED'}: {' '.join(argv)} — {dry_msg}"
+            )
+            logger.info(f"[HealProposeAgent] DRY-RUN: {' '.join(argv)}")
 
         target_service = (
             state.alert_event.target_service if state.alert_event else "unknown"
         )
 
         heal_event = HealEvent(
+            event_type=EventType.HEAL_PROPOSED,
             rca_event_id=rca.event_id,
             heal_level=playbook_level,
             action_type=action_type,
             action_params={
                 "command": " ".join(argv) if argv else None,
+                # 待执行的 argv 随事件一起流转，执行阶段直接用它，不重新推导
+                "argv": argv,
                 "service": target_service,
                 "container": playbook.get("target_container"),
                 "read_only": bool(playbook.get("read_only")),
@@ -421,39 +443,111 @@ class HealAgent(BaseAgent):
             estimated_impact=playbook["description"],
             blast_radius=blast_radius,
             dry_run_result=dry_run_result,
-            execution_result=execution_result,
             correlation_id=state.incident_id,
         )
-        heal_event.event_type = event_type
 
         state.heal_event = heal_event
-        state.status = "healing"
+        state.status = "pending_approval"
 
-        await self.event_bus.publish("aiops.commands", heal_event)
+        # 提议发 events，命令发 commands —— 未经批准的东西不该进 commands 主题
+        await self.event_bus.publish("aiops.events", heal_event)
 
         logger.info(
-            f"[HealAgent] Action: {action_type} [{playbook_level.value}] "
+            f"[HealProposeAgent] 提议: {action_type} [{playbook_level.value}] "
             f"blast_radius={blast_radius:.2f} container={playbook.get('target_container')}"
         )
         return state
 
-    def _select_best_action(self, suggested_actions: list[str]) -> str:
-        """选择修复方案
 
-        尊重 RCA 的排序：suggested_actions 是有序的（首选动作在前），
-        取第一个本系统有 playbook 的动作。原实现用固定的全局优先级，
-        会忽略 RCA 的判断（曾把 Redis 故障选成 rate_limit）。
-        """
-        for action in suggested_actions or []:
-            if action in SHORTLINK_PLAYBOOKS:
-                return action
-        # RCA 给的动作一个都没有 playbook → 退回只读诊断，至少产出真实信息
-        return "check_dependency"
+class HealExecuteAgent(BaseAgent):
+    """自愈执行 Agent —— 仅在 ChangeAgent 审批通过、且动作为 L0 时才执行
 
-    def _render_argv(self, playbook: dict[str, Any]) -> Optional[list[str]]:
-        """渲染命令 argv；playbook 不可执行时返回 None"""
-        template = playbook.get("argv_template")
-        if not template:
-            return None
-        container = playbook.get("target_container") or ""
-        return [part.replace("{container}", container) for part in template]
+    这是「审批是闸门」的落点：ChangeAgent 拒绝或降级为 L1/L2 时，这里什么都不做。
+    """
+
+    def __init__(
+        self,
+        event_bus: EventBus,
+        dry_run: bool = True,
+        executor: Optional[DockerExecutor] = None,
+        circuit_breaker: Optional[CircuitBreaker] = None,
+    ):
+        super().__init__(AgentType.HEAL, event_bus, "HealExecuteAgent")
+        # dry_run=True 时只校验命令、不执行（安全默认）
+        self._dry_run = dry_run
+        self._executor = executor or DockerExecutor()
+        self._circuit_breaker = circuit_breaker or CircuitBreaker()
+
+    async def process(self, state: IncidentState) -> IncidentState:
+        heal = state.heal_event
+        if not heal:
+            logger.warning("[HealExecuteAgent] No heal event to execute")
+            return state
+
+        change = state.change_event
+        if change is None:
+            logger.info("[HealExecuteAgent] 尚未进入审批环节，不执行")
+            return state
+
+        if change.approval_status != "approved":
+            logger.info(
+                f"[HealExecuteAgent] 审批未通过（{change.approval_status}，"
+                f"审批人={change.approver}），不执行 {heal.action_type}"
+            )
+            state.status = "pending_approval"
+            return state
+
+        if heal.heal_level != HealLevel.L0_AUTO:
+            logger.info(
+                f"[HealExecuteAgent] {heal.action_type} 为 {heal.heal_level.value} 级，"
+                f"不自动执行，转人工处理"
+            )
+            state.status = "awaiting_human"
+            return state
+
+        argv = heal.action_params.get("argv")
+        if not argv:
+            logger.info(
+                f"[HealExecuteAgent] {heal.action_type} 没有可执行命令，转人工："
+                f"{heal.action_params.get('manual_reason')}"
+            )
+            state.status = "awaiting_human"
+            return state
+
+        if self._dry_run:
+            heal.execution_result = (
+                "未执行：dry_run 模式（AIOPS_HEAL_DRY_RUN=false 可开启真实执行）"
+            )
+            state.status = "approved"
+            return state
+
+        playbook = SHORTLINK_PLAYBOOKS.get(heal.action_type, {})
+        timeout = playbook.get("estimated_duration_sec", 60) * 3
+        ok, out = await self._executor.run(argv, timeout_sec=timeout)
+        execution_result = f"{'SUCCESS' if ok else 'FAILED'}: {out}"
+
+        verify_container = playbook.get("verify_container")
+        if ok and verify_container:
+            v_ok, v_out = await self._executor.verify_healthy(verify_container)
+            execution_result += f" | 执行后验证: {v_out}"
+            ok = v_ok
+
+        heal.execution_result = execution_result
+        logger.info(f"[HealExecuteAgent] 执行结果: {execution_result}")
+
+        if ok:
+            self._circuit_breaker.record_success()
+            heal.event_type = EventType.HEAL_COMPLETED
+            state.status = "resolved"
+        else:
+            self._circuit_breaker.record_failure()
+            heal.event_type = EventType.HEAL_FAILED
+            state.status = "heal_failed"
+
+        await self.event_bus.publish("aiops.commands", heal)
+
+        logger.info(
+            f"[HealExecuteAgent] 执行: {heal.action_type} [{heal.heal_level.value}] "
+            f"结果={'成功' if ok else '失败'}"
+        )
+        return state

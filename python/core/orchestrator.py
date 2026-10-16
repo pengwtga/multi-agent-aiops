@@ -7,9 +7,14 @@
 4. 重试机制：单个 Agent 失败自动重试，超过次数则跳过或上报
 
 LangGraph 风格的图编排（简化实现，不强依赖 LangGraph 库）：
-  Monitor → RCA → Heal → Change → End
-     ↓         ↓       ↓
-   (skip)   (skip)  (rejected → retry/escalate)
+  Monitor → RCA → HealPropose → Change → HealExecute → End
+              ↓         ↓           ↓           ↓
+            (skip)    (skip)   (rejected →   (仅审批通过
+                                 escalate)    且 L0 才执行)
+
+阶段 5 修复：原来是 Monitor → RCA → Heal → Change，Heal 自己就执行了、
+Change 事后补一条「审批通过」——审批不是闸门而是橡皮图章。
+现在把自愈拆成「提议」与「执行」两段，审批夹在中间，真正决定要不要执行。
 
 面试关键问答：
 Q: "为什么不用简单的 Pipeline？为什么要状态机？"
@@ -17,8 +22,12 @@ A: Pipeline 是线性的，无法处理条件分支、重试、跳过、回退�
    状态机支持：
    - 条件路由（RCA 置信度低 → 重新分析）
    - 失败重试（Heal 执行失败 → 重试 3 次）
-   - 人工介入（Change 被拒 → 暂停等待审批）
+   - 人工介入（Change 被拒 → 不执行，转人工）
    - 检查点恢复（服务重启后从断点继续）
+   Q: "审批和执行怎么保证顺序？"
+   A: 靠图结构保证：heal_propose 只产出方案，change 做风险评分与审批，
+   heal_execute 的入边条件是「已有审批且通过」。执行 Agent 内部还会再
+   校验一次审批状态与级别 —— 即使有人改了图，也不会绕过闸门被执行。
 """
 
 import asyncio
@@ -30,7 +39,11 @@ from typing import Any, Callable, Optional
 from agents.base_agent import BaseAgent
 from agents.monitor_agent import MonitorAgent
 from agents.rca_agent import RCAAgent
-from agents.heal_agent import HealAgent
+from agents.heal_agent import (
+    CircuitBreaker,
+    HealExecuteAgent,
+    HealProposeAgent,
+)
 from agents.change_agent import ChangeAgent
 from core.event_bus import EventBus
 from models.events import AgentType, IncidentState
@@ -96,15 +109,24 @@ class Orchestrator:
         self._build_default_workflow()
 
     def _build_default_workflow(self) -> None:
-        """构建默认工作流：Monitor → RCA → Heal → Change"""
+        """构建默认工作流：Monitor → RCA → HealPropose → Change → HealExecute"""
         monitor = MonitorAgent(self.event_bus)
         rca = RCAAgent(self.event_bus, evidence_provider=self._evidence_provider)
-        heal = HealAgent(
+        change = ChangeAgent(self.event_bus)
+
+        # 提议与执行共享同一个熔断器：否则两边各记一套失败计数，
+        # 执行侧熔断了提议侧还在提议，状态会不一致
+        self._heal_circuit_breaker = CircuitBreaker()
+        heal_propose = HealProposeAgent(
+            self.event_bus,
+            max_blast_radius=self._heal_max_blast_radius,
+            circuit_breaker=self._heal_circuit_breaker,
+        )
+        heal_execute = HealExecuteAgent(
             self.event_bus,
             dry_run=self._heal_dry_run,
-            max_blast_radius=self._heal_max_blast_radius,
+            circuit_breaker=self._heal_circuit_breaker,
         )
-        change = ChangeAgent(self.event_bus)
 
         self._nodes = [
             WorkflowNode(
@@ -118,8 +140,8 @@ class Orchestrator:
                 condition=lambda s: s.alert_event is not None,
             ),
             WorkflowNode(
-                name="heal",
-                agent=heal,
+                name="heal_propose",
+                agent=heal_propose,
                 condition=lambda s: (
                     s.rca_event is not None and s.rca_event.confidence >= 0.3
                 ),
@@ -128,6 +150,16 @@ class Orchestrator:
                 name="change",
                 agent=change,
                 condition=lambda s: s.heal_event is not None,
+            ),
+            WorkflowNode(
+                name="heal_execute",
+                agent=heal_execute,
+                # 只有审批通过的才进入执行节点；未通过直接 SKIPPED，一目了然
+                condition=lambda s: (
+                    s.heal_event is not None
+                    and s.change_event is not None
+                    and s.change_event.approval_status == "approved"
+                ),
             ),
         ]
 
@@ -253,6 +285,10 @@ async def run_demo():
         print(f"    级别:     {state.heal_event.heal_level.value}")
         print(f"    爆炸半径: {state.heal_event.blast_radius:.2f}")
         print(f"    Dry-run:  {state.heal_event.dry_run_result}")
+        if state.heal_event.execution_result:
+            print(f"    执行结果: {state.heal_event.execution_result}")
+        else:
+            print(f"    执行结果: 未执行（状态 {state.status}）")
 
     if state.change_event:
         print(f"\n  [审批]")
