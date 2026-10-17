@@ -92,6 +92,7 @@ def build_state(
     workflow: Optional[list[dict[str, Any]]],
     drill_enabled: bool,
     alert_workflow: Optional[list[dict[str, Any]]] = None,
+    last_check: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """把 monitor/status + incidents + workflow 聚合成页面结构
 
@@ -207,7 +208,25 @@ def build_state(
             }
         )
 
+    # 最近一次「立即巡检」的一句话结论。健康时巡检是 0 告警，页面不会
+    # 新增任何历史事件、告警数也不变 —— 没有这条，用户点了按钮看不到
+    # 任何变化，只会以为「没反应」。
+    if not last_check:
+        last_check_text = "尚未手动巡检"
+    else:
+        checked = (last_check.get("rules_checked") or 0) + (
+            last_check.get("baselines_checked") or 0
+        )
+        at = str(last_check.get("at") or "")
+        at = at[11:19] if len(at) >= 19 else at  # 只留 HH:MM:SS，日期页面不通告
+        alerts = last_check.get("alerts") or 0
+        last_check_text = (
+            f"最近巡检 {at} · 检查 {checked} 项 · "
+            + (f"告警 {alerts} 条" if alerts else "一切正常")
+        )
+
     return {
+        "last_check_text": last_check_text,
         "monitor": {
             "cycles": (monitor_status or {}).get("cycles"),
             "running": (monitor_status or {}).get("running"),
@@ -237,8 +256,12 @@ def build_state(
 
 @router.get("/dashboard", response_class=HTMLResponse)
 async def dashboard_page():
-    """返回自愈闭环可视化页面"""
-    return DASHBOARD_HTML
+    """返回自愈闭环可视化页面
+
+    no-store：页面（含内联 JS）改过之后，浏览器若缓存了旧版本，按钮还会
+    打旧端点 —— 表现就是「改了代码但点了没反应」。
+    """
+    return HTMLResponse(DASHBOARD_HTML, headers={"Cache-Control": "no-store"})
 
 
 DASHBOARD_HTML = """
@@ -338,6 +361,7 @@ DASHBOARD_HTML = """
   <h2>操作</h2>
   <div class="actions">
     <button id="btn-inspect">立即巡检</button>
+    <span class="hint" id="inspect-hint"></span>
     <button id="btn-drill" class="warn">故障演练</button>
     <button id="btn-restore" class="ghost">恢复容器</button>
     <span class="hint" id="drill-hint"></span>
@@ -453,6 +477,7 @@ async function refresh(){
     btn.disabled = !s.drill_enabled;
     document.getElementById('drill-hint').textContent = s.drill_enabled
       ? '' : '故障演练已禁用（需 AIOPS_DRILL_ENABLED=true 启动）';
+    document.getElementById('inspect-hint').textContent = s.last_check_text || '';
     renderPipeline(s); renderCards(s); renderHistory(s);
   }catch(e){
     document.getElementById('live-text').textContent = '连接失败';
@@ -468,7 +493,9 @@ document.getElementById('btn-inspect').onclick = async function(){
     var r = await fetch('/api/v1/monitor/check', {
       method:'POST', headers:{'Content-Type':'application/json'} });
     var d = await r.json();
-    toast('巡检完成：本轮告警 ' + (d.alerts_this_cycle || 0) + ' 条');
+    var n = d.alerts_this_cycle || 0;
+    toast('巡检完成：检查 ' + (d.checked || 0) + ' 项，'
+      + (n ? '告警 ' + n + ' 条' : '一切正常（无新增告警）'));
   }catch(e){ toast('巡检失败', true); }
   finally{ this.disabled = false; refresh(); }
 };

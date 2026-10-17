@@ -43,6 +43,8 @@ orchestrator: Optional[Orchestrator] = None
 knowledge_graph: Optional[InMemoryKnowledgeGraph] = None
 monitor_loop: Optional[MonitorLoop] = None
 incident_history: list[dict[str, Any]] = []
+# 最近一次「立即巡检」的概况（只用于页面展示，不进事件历史）
+last_manual_check: Optional[dict[str, Any]] = None
 
 
 @asynccontextmanager
@@ -222,12 +224,20 @@ async def monitor_check():
     """
     if not monitor_loop:
         raise HTTPException(status_code=503, detail="Monitor loop not enabled")
-    fired = await monitor_loop.run_once()
+
+    global last_manual_check
+    summary = await monitor_loop.run_once()
+    # 记下这次巡检的概况：健康时一轮跑完是 0 告警，页面上不会新增任何
+    # 历史事件 / 告警数，用户点了会以为「没反应」。故把巡检本身落一条
+    # 可见记录（只展示，不进事件历史，不破坏告警数与事件数的 1:1）。
+    last_manual_check = dict(summary, at=_to_local(datetime.utcnow()))
     return {
         "ok": True,
         "cycles": monitor_loop.cycles,
-        "alerts_this_cycle": fired,
+        "alerts_this_cycle": summary["alerts"],
         "alerts_total": len(monitor_loop.alerts_fired),
+        "checked": summary["rules_checked"] + summary["baselines_checked"],
+        "last_check": last_manual_check,
     }
 
 
@@ -357,6 +367,7 @@ async def get_dashboard_state():
         workflow=orchestrator.get_workflow_status(),
         drill_enabled=settings.drill_enabled,
         alert_workflow=orchestrator.get_last_alert_workflow(),
+        last_check=last_manual_check,
     )
 
 

@@ -252,7 +252,7 @@ class MonitorLoop:
                 logger.exception("[MonitorLoop] cycle failed")
             await asyncio.sleep(self._interval)
 
-    async def run_once(self) -> int:
+    async def run_once(self) -> dict:
         """手动跑一轮采集（Dashboard「立即巡检」）
 
         为什么要单独暴露：原来的「立即巡检」打的是 /api/v1/incidents/trigger，
@@ -262,11 +262,21 @@ class MonitorLoop:
         走这里就和自动巡检完全同源：同样的规则 + 基线，告警数与事件数
         一起 +1，不会出现「事件涨了、告警没涨」。
 
-        返回本轮新触发的告警数。
+        返回本轮概况。系统健康时告警数为 0，页面上不会有任何新增记录 ——
+        所以必须把「检查了多少项、结论如何」一并返回，否则用户点了
+        「立即巡检」看不到任何变化，以为按钮坏了。
         """
+        started = datetime.utcnow()
         before = len(self.alerts_fired)
         await self._run_cycle()
-        return len(self.alerts_fired) - before
+        return {
+            "alerts": len(self.alerts_fired) - before,
+            "rules_checked": len(self._rules),
+            "baselines_checked": len(BASELINE_QUERIES),
+            "duration_ms": round(
+                (datetime.utcnow() - started).total_seconds() * 1000, 1
+            ),
+        }
 
     def _emit_incident(self, state) -> None:
         """把一次「有告警」的闭环回写到事件历史
