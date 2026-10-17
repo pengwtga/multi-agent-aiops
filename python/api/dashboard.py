@@ -91,6 +91,7 @@ def build_state(
     incidents: Optional[dict[str, Any]],
     workflow: Optional[list[dict[str, Any]]],
     drill_enabled: bool,
+    alert_workflow: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     """把 monitor/status + incidents + workflow 聚合成页面结构
 
@@ -132,9 +133,19 @@ def build_state(
     # 为什么：节点状态是**全局共享**的。自愈跑完后，监控循环下一轮若无告警，
     # 会把 rca 之后的节点重新置为 SKIPPED，把刚跑完的闭环结果冲掉 ——
     # 页面上就只剩「已完成 + 已跳过」，看着像自愈没跑到底。
-    wf_source = (active or {}).get("workflow") if has_alert else None
+    # 优先用编排器的「有告警闭环」快照，其次才退回历史事件里的快照。
+    #
+    # 为什么顺序不能反：这份快照有三个关键时刻的行为都对
+    #   - 闭环跑的过程中：逐节点更新 → 前端能看到节点一个个亮起
+    #   - 演练重置时：被清空 → 流水线回到空闲态（新一轮的起点）
+    #   - 闭环跑完后：保留完整结果，不会被后续无告警的轮次冲掉
+    # 若让历史事件快照优先，演练后它仍然非空，流水线就会一直挂着
+    # 上一轮的「已完成」，看不到新一轮从零开始。
+    wf_source = alert_workflow or (
+        (active or {}).get("workflow") if has_alert else None
+    )
     wf_by_name: dict[str, dict[str, Any]] = {
-        w.get("name"): w for w in (wf_source or workflow or [])
+        w.get("name"): w for w in (wf_source or [])
     }
 
     def _parse_ts(ts: Optional[str]) -> Optional[datetime]:
@@ -160,8 +171,10 @@ def build_state(
     for idx, (key, label, agent) in enumerate(PIPELINE):
         wf = wf_by_name.get(key) or {}
         status = wf.get("status") or "pending"
-        if not has_alert:
-            # 无告警：monitor 处于常态化监控，后续节点尚未触发
+        # 没有可用快照时才是空闲态。此前只看 has_alert，于是闭环跑的过程中
+        #（事件要等 5 个节点全跑完才写入）进度被强行覆盖成「监控中/待触发」
+        # ——表现就是节点不逐个亮起，而是等自愈执行完后一次性全亮。
+        if not wf_source:
             status = "monitoring" if idx == 0 else "idle"
         text, color = _style(status)
         pipeline.append(

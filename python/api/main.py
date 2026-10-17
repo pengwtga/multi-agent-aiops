@@ -330,6 +330,7 @@ async def get_dashboard_state():
         },
         workflow=orchestrator.get_workflow_status(),
         drill_enabled=settings.drill_enabled,
+        alert_workflow=orchestrator.get_last_alert_workflow(),
     )
 
 
@@ -461,7 +462,11 @@ async def drill_inject(request: DrillRequest):
             # 清空告警去重缓存：演练是人为注入的新故障事件，
             # 不该被上一次告警的 5 分钟窗口抑制（否则「点了没反应」）
             orchestrator.clear_monitor_fingerprints()
-        incident_history.clear()
+        # 只重置流水线，**不清空** incident_history 与 alerts_fired。
+        #
+        # 事件历史是「历史」，跨演练累积才能横向对比多次结果；而右上角
+        # 「告警数」读的是 alerts_fired，它和事件数都在「有告警」时各自
+        # +1，天然 1:1。清掉其中任一个，两个数字就会对不上。
         probe_code = await _resolve_probe_code()
         logger.warning(f"[DRILL] 探测短链码: {probe_code or '(未拿到)'}")
 

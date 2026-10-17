@@ -113,6 +113,16 @@ class Orchestrator:
         self._heal_max_blast_radius = heal_max_blast_radius
         self._nodes: list[WorkflowNode] = []
         self._checkpoints: dict[str, IncidentState] = {}
+        # 最近一次「有告警」闭环的节点状态快照。
+        #
+        # 为什么要单独存一份：self._nodes 是**全局共享**的，一轮监控里会跑
+        # 多次 run()（规则层每规则一次 + 基线层每 series 一次），无告警的那
+        # 次会把已完成节点重新置为 SKIPPED，把刚跑完的闭环结果冲掉。
+        #
+        # 这份快照只在「有告警」的闭环里更新，且在 run() 期间**逐节点**写入
+        # ——于是 Dashboard 能看到流水线一个个亮起，而不是等自愈执行完
+        # （这一节点要跑好几秒）才一次性刷新。
+        self._last_alert_workflow: list[dict[str, Any]] = []
         self._build_default_workflow()
 
     def _build_default_workflow(self) -> None:
@@ -182,6 +192,15 @@ class Orchestrator:
 
         logger.info(f"[Orchestrator] Starting workflow for incident {state.incident_id}")
 
+        # 先把所有节点清空为 pending：否则还没轮到的节点会残留**上一轮**
+        # run() 留下的状态（无告警的轮次会把它置为 SKIPPED），前端就会看到
+        # 尚未执行的节点显示「已跳过」。
+        for node in self._nodes:
+            node.status = NodeStatus.PENDING
+            node.started_at = None
+            node.ended_at = None
+            node.duration_ms = 0.0
+
         for node in self._nodes:
             if not node.should_execute(state):
                 node.status = NodeStatus.SKIPPED
@@ -192,6 +211,11 @@ class Orchestrator:
             node.started_at = datetime.utcnow()
             node.ended_at = None
             node.duration_ms = 0.0
+            # 进入执行就发一次快照：否则耗时最长的节点（自愈执行要好几秒）
+            # 在整个执行期间都停留在上一次快照的状态，用户看不到「执行中」，
+            # 只能干等它跑完才跳成「已完成」。
+            if state.alert_event is not None:
+                self._last_alert_workflow = self.get_workflow_status()
             success = False
 
             while node.retry_count <= node.max_retries:
@@ -230,6 +254,12 @@ class Orchestrator:
                 if node.started_at
                 else 0.0
             )
+
+            # 有告警时逐节点发布进度：让 Dashboard 能看到流水线一个个亮起，
+            # 而不是等自愈执行完（这一节点要跑好几秒）才一次性刷新。
+            # 无告警的 run() 不动这份快照，避免把闭环结果冲成 SKIPPED。
+            if state.alert_event is not None:
+                self._last_alert_workflow = self.get_workflow_status()
 
             self._save_checkpoint(state)
 
@@ -276,6 +306,16 @@ class Orchestrator:
             node.started_at = None
             node.ended_at = None
             node.duration_ms = 0.0
+        self._last_alert_workflow = []
+
+    def get_last_alert_workflow(self) -> list[dict[str, Any]]:
+        """最近一次「有告警」闭环的节点状态快照
+
+        与 get_workflow_status() 的区别：后者是**当前**节点状态，会被无告警
+        的 run() 冲成 SKIPPED；这份只记录有告警的闭环，且保留到下一次闭环
+        覆盖为止。Dashboard 优先读这份，才能看到节点逐个亮起。
+        """
+        return self._last_alert_workflow
 
     def get_workflow_status(self) -> list[dict[str, Any]]:
         return [
