@@ -329,6 +329,7 @@ DASHBOARD_HTML = """
                  border: 1px solid var(--border); font-weight: 500; }
   button.warn { background: #f59e0b; }
   .hint { font-size: 12px; color: var(--muted); }
+  .hints { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 10px; min-height: 20px; }
 
   table { width: 100%; border-collapse: collapse; background: var(--card);
           border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
@@ -361,9 +362,12 @@ DASHBOARD_HTML = """
   <h2>操作</h2>
   <div class="actions">
     <button id="btn-inspect">立即巡检</button>
-    <span class="hint" id="inspect-hint"></span>
     <button id="btn-drill" class="warn">故障演练</button>
     <button id="btn-restore" class="ghost">恢复容器</button>
+  </div>
+  <!-- 提示统一放到按钮下方：夹在按钮中间会挤开三个按钮，也不好读 -->
+  <div class="hints">
+    <span class="hint" id="inspect-hint"></span>
     <span class="hint" id="drill-hint"></span>
   </div>
 </section>

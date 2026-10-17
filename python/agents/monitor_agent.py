@@ -175,6 +175,16 @@ class MonitorAgent(BaseAgent):
 
         rule_violation = state.metadata.get("rule_violation")
         if rule_violation:
+            kind = rule_violation.get("kind", "root_cause")
+            # 同根因收敛：同一服务的根因类告警已在窗口内开过闭环，症状类
+            # 告警就不再单独立事件 —— 否则一次故障会开出 N 个闭环、
+            # 重复自愈，还常因探针被稀释证伪而误判成「部署缺陷」。
+            if kind == "symptom" and self._has_recent_root_cause_alert(target_service):
+                logger.info(
+                    f"[MonitorAgent] Rule alert suppressed (symptom of an active "
+                    f"root-cause alert): {rule_violation.get('name')} on {target_service}"
+                )
+                return state
             alert = self._build_rule_alert(
                 rule_violation, metric_name, current_value,
                 target_service, labels, state.incident_id,
@@ -220,7 +230,7 @@ class MonitorAgent(BaseAgent):
         state.alert_event = alert
         state.status = "investigating"
         if rule_violation:
-            self._note_rule_alert(target_service)
+            self._note_rule_alert(target_service, kind)
 
         await self.event_bus.publish("aiops.alerts", alert)
         logger.info(f"[MonitorAgent] Alert fired: {alert.alert_name} [{alert.severity.value}]")
@@ -277,19 +287,35 @@ class MonitorAgent(BaseAgent):
             correlation_id=correlation_id,
         )
 
-    def _note_rule_alert(self, target_service: str) -> None:
-        """记下规则层告警，供统计层判断「这个服务已经在被处理了」"""
-        self._rule_alert_at[target_service] = datetime.utcnow()
+    def _note_rule_alert(self, target_service: str, kind: str = "root_cause") -> None:
+        """记下规则层告警：供统计层的症状抑制与规则层的同根因收敛使用"""
+        self._rule_alert_at[target_service] = {
+            "at": datetime.utcnow(),
+            "kind": kind,
+        }
+
+    def _cleanup_rule_alerts(self) -> None:
+        now = datetime.utcnow()
+        self._rule_alert_at = {
+            svc: rec
+            for svc, rec in self._rule_alert_at.items()
+            if now - rec["at"] < self._symptom_window
+        }
 
     def _has_recent_rule_alert(self, target_service: str) -> bool:
         """该服务是否刚被规则层告警点名（其统计异常多半只是症状）"""
-        now = datetime.utcnow()
-        self._rule_alert_at = {
-            svc: at
-            for svc, at in self._rule_alert_at.items()
-            if now - at < self._symptom_window
-        }
+        self._cleanup_rule_alerts()
         return target_service in self._rule_alert_at
+
+    def _has_recent_root_cause_alert(self, target_service: str) -> bool:
+        """该服务是否刚被**根因类**规则告警点名
+
+        单向抑制：症状类（如 redirect_5xx_rate）被根因类抑制，根因类不受
+        症状类影响。反过来做会出问题 —— 若症状先到、根因后到，根因会被
+        症状挡住，而症状的 RCA 又常常定位不出根因，故障就没人处理了。
+        """
+        self._cleanup_rule_alerts()
+        return self._rule_alert_at.get(target_service, {}).get("kind") == "root_cause"
 
     @staticmethod
     def _below_noise_floor(

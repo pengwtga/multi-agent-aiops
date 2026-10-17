@@ -74,6 +74,10 @@ SHORTLINK_TOPOLOGY = {
 # 兼容旧名（编排器/测试可能引用）
 MOCK_SERVICE_TOPOLOGY = SHORTLINK_TOPOLOGY
 
+# 所有探针都被证伪时的输出：承认没定位出来，而不是编一个像样的答案
+UNRESOLVED_ROOT_CAUSE = "未能定位根因：所有证据探针均被真实指标证伪（转人工）"
+UNRESOLVED_ACTIONS = ["check_dependency"]
+
 
 def _verify(promql: str, comparator: str = "gt", threshold: float = 0.0) -> dict:
     """构造一个证据探针：用 PromQL 实测值证实或证伪某候选根因
@@ -84,6 +88,11 @@ def _verify(promql: str, comparator: str = "gt", threshold: float = 0.0) -> dict
     实测踩过的坑：应用重启后若跳转从未成功过，`shortlink_redirect_total`
     这个 Micrometer 计数器根本不会注册出序列，`rate()` 又因为窗口内不足
     2 个采样点返回空——探针拿到 None 会让判据直接失效。
+
+    窗口统一用 [30s] 而不是 [2m]（踩过的第二个坑）：故障演练只持续几十秒，
+    [2m] 的平均速率会把故障前的健康数据一起平均进来，于是「吞吐归零」
+    这类判据永远不成立（实测 0.4762 req/s），探针集体被证伪、根因归因
+    失败。30s 与 Prometheus 15s 抓取间隔配合仍有 2 个采样点。
     """
     return {
         "promql": f"({promql}) or vector(0)",
@@ -107,7 +116,7 @@ SHORTLINK_FAULT_PATTERNS: dict[str, list[dict[str, Any]]] = {
             "base_probability": 0.45,
             # Redis 挂掉时所有跳转都 500，成功跳转吞吐归零——这是最强判据
             "verify": _verify(
-                'sum(rate(shortlink_redirect_total{job="shortlink-app"}[2m]))',
+                'sum(rate(shortlink_redirect_total{job="shortlink-app"}[30s]))',
                 "lt", 0.05,
             ),
             "suggested_actions": ["restart_redis", "check_dependency"],
@@ -120,7 +129,7 @@ SHORTLINK_FAULT_PATTERNS: dict[str, list[dict[str, Any]]] = {
             # 用「命中请求仍成功」是不行的：健康状态下它也成立，等于无法证伪，
             # 会导致正常状态被误判为 MySQL 故障。连接池获取超时才是真信号。
             "verify": _verify(
-                'sum(rate(hikaricp_connections_timeout_total{job="shortlink-app"}[2m]))',
+                'sum(rate(hikaricp_connections_timeout_total{job="shortlink-app"}[30s]))',
                 "gt", 0.0,
             ),
             "suggested_actions": ["restart_mysql", "check_dependency"],
@@ -131,7 +140,7 @@ SHORTLINK_FAULT_PATTERNS: dict[str, list[dict[str, Any]]] = {
             "base_probability": 0.20,
             # 真流量激增时总请求量（含 5xx）应该很高
             "verify": _verify(
-                'sum(rate(http_server_requests_seconds_count{job="shortlink-app"}[2m]))',
+                'sum(rate(http_server_requests_seconds_count{job="shortlink-app"}[30s]))',
                 "gt", 20.0,
             ),
             "suggested_actions": ["scale_app", "rate_limit"],
@@ -173,7 +182,7 @@ SHORTLINK_FAULT_PATTERNS: dict[str, list[dict[str, Any]]] = {
             "base_probability": 0.25,
             "verify": _verify(
                 'sum(rate(hikaricp_connections_timeout_total'
-                '{job="shortlink-app"}[2m]))',
+                '{job="shortlink-app"}[30s]))',
                 "gt", 0.0,
             ),
             "suggested_actions": ["restart_mysql", "check_dependency"],
@@ -184,7 +193,7 @@ SHORTLINK_FAULT_PATTERNS: dict[str, list[dict[str, Any]]] = {
             "base_probability": 0.20,
             "verify": _verify(
                 'sum(rate(http_server_requests_seconds_count'
-                '{job="shortlink-app"}[2m]))',
+                '{job="shortlink-app"}[30s]))',
                 "gt", 50.0,
             ),
             "suggested_actions": ["scale_app", "rate_limit"],
@@ -224,7 +233,7 @@ SHORTLINK_FAULT_PATTERNS: dict[str, list[dict[str, Any]]] = {
             "evidence_pattern": "db_slow",
             "base_probability": 0.35,
             "verify": _verify(
-                'sum(rate(hikaricp_connections_pending{job="shortlink-app"}[2m]))',
+                'sum(rate(hikaricp_connections_pending{job="shortlink-app"}[30s]))',
                 "gt", 0.5,
             ),
             "suggested_actions": ["check_mysql", "restart_consumer"],
@@ -243,7 +252,7 @@ SHORTLINK_FAULT_PATTERNS: dict[str, list[dict[str, Any]]] = {
             "base_probability": 0.55,
             # 滥用时总请求量会明显抬升
             "verify": _verify(
-                'sum(rate(http_server_requests_seconds_count{job="shortlink-app"}[2m]))',
+                'sum(rate(http_server_requests_seconds_count{job="shortlink-app"}[30s]))',
                 "gt", 10.0,
             ),
             "suggested_actions": ["rate_limit", "block_ip"],
@@ -292,7 +301,7 @@ SHORTLINK_FAULT_PATTERNS: dict[str, list[dict[str, Any]]] = {
             "evidence_pattern": "gc_pressure",
             "base_probability": 0.50,
             "verify": _verify(
-                'sum(rate(jvm_gc_pause_seconds_count{job="shortlink-app"}[2m]))',
+                'sum(rate(jvm_gc_pause_seconds_count{job="shortlink-app"}[30s]))',
                 "gt", 1.0,
             ),
             "suggested_actions": ["heap_dump", "restart_container"],
@@ -302,7 +311,7 @@ SHORTLINK_FAULT_PATTERNS: dict[str, list[dict[str, Any]]] = {
             "evidence_pattern": "request_rate_increase",
             "base_probability": 0.35,
             "verify": _verify(
-                'sum(rate(http_server_requests_seconds_count{job="shortlink-app"}[2m]))',
+                'sum(rate(http_server_requests_seconds_count{job="shortlink-app"}[30s]))',
                 "gt", 20.0,
             ),
             "suggested_actions": ["scale_app", "rate_limit"],
@@ -498,17 +507,42 @@ class RCAAgent(BaseAgent):
         best_cause = "Unknown"
         best_confidence = 0.0
         best_actions: list[str] = []
+        # 带探针的候选里，有多少个被真实指标证伪
+        probed = 0
+        refuted = 0
 
         for candidate in candidates:
-            prior = candidate["base_probability"]
-            likelihood, verified = await self._compute_likelihood(candidate, has_recent_change)
+                prior = candidate["base_probability"]
+                likelihood, verified = await self._compute_likelihood(candidate, has_recent_change)
 
-            posterior = self._reasoner.compute_posterior(prior, likelihood)
+                if candidate.get("verify"):
+                    probed += 1
+                    if verified is False:
+                        refuted += 1
 
-            if posterior > best_confidence:
-                best_confidence = posterior
-                best_cause = candidate["root_cause"]
-                best_actions = candidate["suggested_actions"]
+                posterior = self._reasoner.compute_posterior(prior, likelihood)
+
+                if posterior > best_confidence:
+                    best_confidence = posterior
+                    best_cause = candidate["root_cause"]
+                    best_actions = candidate["suggested_actions"]
+
+        # 所有可验证的候选都被真实数据证伪 → 不能拿没有探针的兜底猜测
+        # （如「近期部署引入缺陷」）当答案。
+        #
+        # 实测踩过：Redis 停机时 5xx 告警命中，三条探针因 [2m] 窗口被健康
+        # 数据稀释而全部证伪，最终落到 base_probability 只有 0.10 的兜底
+        # 候选「近期部署引入缺陷」，置信度 0.10 < 0.3 → 不提议自愈 →
+        # Redis 真实停机 25 分钟无人处理。告警在响却什么都不做，比多报
+        # 一条告警严重得多。
+        #
+        # 这时正确的输出是「我没定位出来」，交给人工，而不是编一个答案。
+        if probed and refuted == probed:
+            logger.warning(
+                f"[RCAAgent] {probed} 条探针全部被证伪，拒绝用无探针的兜底猜测作答 "
+                f"（原兜底: {best_cause} {best_confidence:.2f}）→ 转人工"
+            )
+            return UNRESOLVED_ROOT_CAUSE, 0.0, UNRESOLVED_ACTIONS
 
         return best_cause, round(best_confidence, 3), best_actions
 

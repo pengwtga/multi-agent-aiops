@@ -73,6 +73,12 @@ class AlertRule:
     target_service: str
     metric_name: str
     description: str
+    # root_cause：根因信号（如连接堆积、依赖挂起），可独立开闭环
+    # symptom：业务影响/症状（如 5xx 速率）。同一次故障里，根因告警已经
+    #   在处理了，症状告警再开一个闭环只会重复自愈、还常被误归因
+    #   （实测：Redis 停机时 5xx 先到、探针被窗口稀释证伪 → 判成
+    #   「部署缺陷」→ 不自愈）。故症状类被根因类单向抑制。
+    kind: str = "root_cause"
 
     def violated(self, value: float) -> bool:
         if self.comparator == "gt":
@@ -121,6 +127,9 @@ def build_shortlink_rules(job: str = SHORTLINK_JOB) -> list[AlertRule]:
             target_service="shortlink-app",
             metric_name="http_5xx_rate",
             description="跳转/创建路径 5xx 速率超过 0.5 req/s",
+            # 症状：5xx 只说明「有请求失败了」，不说明是谁挂了。任何依赖
+            # 故障（Redis/MySQL）都会命中它，因此不独立开闭环
+            kind="symptom",
         ),
         AlertRule(
             name="consume_lag_backlog",
@@ -316,6 +325,7 @@ class MonitorLoop:
                     "threshold": rule.threshold,
                     "comparator": rule.comparator,
                     "description": rule.description,
+                    "kind": rule.kind,
                 },
             }
             state = await self._orchestrator.run(metadata=metadata)

@@ -9,6 +9,7 @@
 """
 
 import asyncio
+import re
 import sys
 
 from agents.rca_agent import RCAAgent
@@ -21,9 +22,19 @@ def probe(promql: str) -> str:
     return f"({promql}) or vector(0)"
 
 
-PROBE_REDIS = probe('sum(rate(shortlink_redirect_total{job="shortlink-app"}[2m]))')
-PROBE_MYSQL = probe('sum(rate(hikaricp_connections_timeout_total{job="shortlink-app"}[2m]))')
-PROBE_TRAFFIC = probe('sum(rate(http_server_requests_seconds_count{job="shortlink-app"}[2m]))')
+def norm(promql: str) -> str:
+    """归一化时间窗口（[2m]/[30s] → [W]）
+
+    窗口时长是调参项，不是探针语义：实测把窗口从 [2m] 收窄到 [30s] 后，
+    按字面量匹配的桩全部失配，6 个用例一下挂了 4 个 —— 测试断言的是
+    「给定实测值应得出哪个根因」，不该被调窗口这件事影响。
+    """
+    return re.sub(r"\[\w+\]", "[W]", promql)
+
+
+PROBE_REDIS = probe('sum(rate(shortlink_redirect_total{job="shortlink-app"}[30s]))')
+PROBE_MYSQL = probe('sum(rate(hikaricp_connections_timeout_total{job="shortlink-app"}[30s]))')
+PROBE_TRAFFIC = probe('sum(rate(http_server_requests_seconds_count{job="shortlink-app"}[30s]))')
 PROBE_THREADS = probe(
     'sum(tomcat_threads_busy_threads{job="shortlink-app"})'
     ' / sum(tomcat_threads_config_max_threads{job="shortlink-app"})'
@@ -34,12 +45,12 @@ class StubProvider:
     """按 PromQL 返回预设实测值；未预设的查询返回 None（探针无数据）"""
 
     def __init__(self, values: dict):
-        self.values = values
+        self._values = {norm(k): v for k, v in values.items()}
         self.queries: list[str] = []
 
     async def query(self, promql: str):
         self.queries.append(promql)
-        return self.values.get(promql)
+        return self._values.get(norm(promql))
 
 
 async def analyze(alert_name: str, probe_values: dict, target="shortlink-app"):
