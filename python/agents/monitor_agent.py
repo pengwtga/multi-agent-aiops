@@ -133,6 +133,11 @@ class MonitorAgent(BaseAgent):
         self._detector = AnomalyDetector()
         self._history: dict[str, list[float]] = defaultdict(list)
         self._history_max_len = 1000
+        # 规则层告警的「已报时间」，按服务记：用于抑制统计层的症状告警
+        # （详见 _has_recent_rule_alert）
+        self._rule_alert_at: dict[str, datetime] = {}
+        # 与 AlertFingerprint 同窗：同一根因在这段时间内只报一次
+        self._symptom_window = timedelta(seconds=300)
 
     def clear_alert_fingerprints(self) -> None:
         """清空告警去重缓存（供故障演练调用）
@@ -181,6 +186,17 @@ class MonitorAgent(BaseAgent):
                 return state
             # 噪声地板：统计上异常 ≠ 业务上有意义。振幅小于 min_delta 的
             # 扰动直接抑制（详见 collectors.BASELINE_QUERIES 的注释）。
+            # 症状抑制：同一服务刚被规则层点名（如 dependency_hang），
+            # 统计层抓到的往往只是它的**结果**而非新故障 —— 演练时 50 并发
+            # 挂死在 Redis 上，Tomcat 忙碌线程必然堆积，于是又报一条
+            # anomaly_tomcat_busy_threads。根因已经在处理了，症状不该再刷屏。
+            # 时序上规则层先跑（_run_cycle 先规则后基线），同轮内即可生效。
+            if self._has_recent_rule_alert(target_service):
+                logger.info(
+                    f"[MonitorAgent] Anomaly suppressed (symptom of known rule alert): "
+                    f"{metric_name} on {target_service}, score={score:.2f}"
+                )
+                return state
             min_delta = metric_data.get("min_delta")
             if min_delta and self._below_noise_floor(
                 history, current_value, float(min_delta)
@@ -203,6 +219,8 @@ class MonitorAgent(BaseAgent):
 
         state.alert_event = alert
         state.status = "investigating"
+        if rule_violation:
+            self._note_rule_alert(target_service)
 
         await self.event_bus.publish("aiops.alerts", alert)
         logger.info(f"[MonitorAgent] Alert fired: {alert.alert_name} [{alert.severity.value}]")
@@ -258,6 +276,20 @@ class MonitorAgent(BaseAgent):
             labels=labels,
             correlation_id=correlation_id,
         )
+
+    def _note_rule_alert(self, target_service: str) -> None:
+        """记下规则层告警，供统计层判断「这个服务已经在被处理了」"""
+        self._rule_alert_at[target_service] = datetime.utcnow()
+
+    def _has_recent_rule_alert(self, target_service: str) -> bool:
+        """该服务是否刚被规则层告警点名（其统计异常多半只是症状）"""
+        now = datetime.utcnow()
+        self._rule_alert_at = {
+            svc: at
+            for svc, at in self._rule_alert_at.items()
+            if now - at < self._symptom_window
+        }
+        return target_service in self._rule_alert_at
 
     @staticmethod
     def _below_noise_floor(

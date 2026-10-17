@@ -204,7 +204,31 @@ async def trigger_incident(request: TriggerRequest):
 
     result = _snapshot_incident(state)
     incident_history.append(result)
+    # 手动触发的告警也要进自观测告警数：右上角「告警数」与「历史事件数」
+    # 都在「有告警」时各自 +1，缺一个就会对不上（实测：点了两次巡检，
+    # 事件 7 条而告警只有 5 条）。
+    if state.alert_event is not None and monitor_loop is not None:
+        monitor_loop.record_alert(state, source="manual")
     return result
+
+
+@app.post("/api/v1/monitor/check")
+async def monitor_check():
+    """立即巡检：手动跑一轮真实采集（规则层 + 统计层）
+
+    Dashboard「立即巡检」按钮走这里，而不是 /api/v1/incidents/trigger：
+    后者不带指标数据，MonitorAgent 会退化成伪造的 demo 告警
+    （high_cpu_usage），既不是真实巡检结果，也不会计入告警数。
+    """
+    if not monitor_loop:
+        raise HTTPException(status_code=503, detail="Monitor loop not enabled")
+    fired = await monitor_loop.run_once()
+    return {
+        "ok": True,
+        "cycles": monitor_loop.cycles,
+        "alerts_this_cycle": fired,
+        "alerts_total": len(monitor_loop.alerts_fired),
+    }
 
 
 @app.get("/api/v1/incidents")

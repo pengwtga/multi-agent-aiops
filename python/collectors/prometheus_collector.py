@@ -252,6 +252,22 @@ class MonitorLoop:
                 logger.exception("[MonitorLoop] cycle failed")
             await asyncio.sleep(self._interval)
 
+    async def run_once(self) -> int:
+        """手动跑一轮采集（Dashboard「立即巡检」）
+
+        为什么要单独暴露：原来的「立即巡检」打的是 /api/v1/incidents/trigger，
+        那个端点不带 metric_data，MonitorAgent 会 fallback 到**伪造的 demo
+        告警**（high_cpu_usage）—— 既不是真实巡检结果，还只进事件历史、
+        不进自观测告警数，右上角计数永远不涨。
+        走这里就和自动巡检完全同源：同样的规则 + 基线，告警数与事件数
+        一起 +1，不会出现「事件涨了、告警没涨」。
+
+        返回本轮新触发的告警数。
+        """
+        before = len(self.alerts_fired)
+        await self._run_cycle()
+        return len(self.alerts_fired) - before
+
     def _emit_incident(self, state) -> None:
         """把一次「有告警」的闭环回写到事件历史
 
@@ -300,7 +316,7 @@ class MonitorLoop:
                     f"[MonitorLoop] 规则命中: {rule.name} "
                     f"value={value} threshold={rule.threshold}"
                 )
-            self._record_alert(state, source="rule")
+            self.record_alert(state, source="rule")
 
         # ---- 2. 基线指标（统计异常检测层预热）----
         for series in BASELINE_QUERIES:
@@ -320,9 +336,9 @@ class MonitorLoop:
             if state.alert_event is not None:
                 self._emit_incident(state)
             # 统计层捕获的是「未知突变」，同样要进自观测列表，否则状态端点是瞎的
-            self._record_alert(state, source="statistical")
+            self.record_alert(state, source="statistical")
 
-    def _record_alert(self, state, source: str) -> None:
+    def record_alert(self, state, source: str) -> None:
         """记录一次告警到自观测列表（规则层与统计层共用）"""
         alert = state.alert_event
         if not alert:

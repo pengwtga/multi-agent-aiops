@@ -463,11 +463,12 @@ document.getElementById('btn-inspect').onclick = async function(){
   this.disabled = true;
   toast('已触发巡检，等待工作流完成…');
   try{
-    var r = await fetch('/api/v1/incidents/trigger', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({}) });
+    // 走真实采集循环：/api/v1/incidents/trigger 不带指标，会退化成伪造的
+    // demo 告警，且不进告警数（右上角不涨），与「巡检」的语义不符
+    var r = await fetch('/api/v1/monitor/check', {
+      method:'POST', headers:{'Content-Type':'application/json'} });
     var d = await r.json();
-    toast('巡检完成：' + (d.status || ''));
+    toast('巡检完成：本轮告警 ' + (d.alerts_this_cycle || 0) + ' 条');
   }catch(e){ toast('巡检失败', true); }
   finally{ this.disabled = false; refresh(); }
 };
