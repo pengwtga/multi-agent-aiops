@@ -323,7 +323,13 @@ class Orchestrator:
             node.started_at = None
             node.ended_at = None
             node.duration_ms = 0.0
-        self._last_alert_workflow = []
+            node.skip_reason = None
+        # 这里**不能**置空：置空后 Dashboard 会回退到「最近事件的快照」，
+        # 而那是上一轮已跑完的流水线 —— 于是点演练后前 4 个节点依旧是
+        # 「已完成」，只有最慢的自愈执行（好几秒）才看得出在动，整体看着
+        # 像「显示有延迟」。改成发布一份重置之后的初始快照，点下去的瞬间
+        # 就是干净的待执行态，之后由闭环逐节点覆盖。
+        self._last_alert_workflow = self.get_workflow_status()
 
     def get_last_alert_workflow(self) -> list[dict[str, Any]]:
         """最近一次「有告警」闭环的节点状态快照
