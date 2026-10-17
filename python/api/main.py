@@ -10,7 +10,9 @@
 
 import asyncio
 import contextlib
+import json
 import logging
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -339,6 +341,76 @@ class DrillRequest(BaseModel):
     container: str = "shortlink-redis"
 
 
+async def _docker_inspect(container: str, fmt: str) -> Optional[str]:
+    """docker inspect -f 的薄封装：失败/不存在一律返回 None"""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "inspect", "-f", fmt, container,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[DRILL] docker inspect {container} 失败: {e}")
+        return None
+    if proc.returncode != 0:
+        return None
+    return (out or b"").decode(errors="replace").strip()
+
+
+async def _ensure_running(container: str, timeout: float = 30.0) -> bool:
+    """取探测码前先保证容器在跑（且健康）
+
+    为什么要「偷偷恢复」一次（实测踩出来的坑）：
+        Redis 被上一轮自愈重启后缓存是空的，若上一轮没跑到自愈
+        （例如只命中了一个低置信度的统计告警），Redis 就一直是停止状态。
+        此时 `docker exec ... redis-cli --scan` 直接失败 → 拿不到短链码
+        → 不发探测负载 → dependency_hang 的判据（连接堆积 + 吞吐归零）
+        永远不成立 → 演练看不到任何真实故障，页面上只剩一个无关的
+        统计告警在跑。
+
+    这只发生在**点演练的那一刻、注入故障之前**，是演练流程的一部分，
+    不影响真实故障的自愈判定。
+    """
+    running = await _docker_inspect(container, "{{.State.Running}}")
+    if running is None:
+        logger.warning(f"[DRILL] 容器不存在或 docker 不可用: {container}")
+        return False
+
+    if running != "true":
+        logger.warning(f"[DRILL] {container} 未运行，先拉起以便取探测码")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "docker", "start", container,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=30)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[DRILL] docker start {container} 失败: {e}")
+            return False
+        if proc.returncode != 0:
+            logger.warning(
+                f"[DRILL] docker start {container} 失败 rc={proc.returncode} "
+                f"{(err or b'').decode(errors='replace').strip()}"
+            )
+            return False
+
+    # 等 healthcheck 通过再取码：容器刚起来时 redis-cli 可能还没就绪。
+    # 没有配置 healthcheck 的容器（inspect 返回空）直接放行。
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        health = await _docker_inspect(
+            container, "{{if .State.Health}}{{.State.Health.Status}}{{end}}"
+        )
+        if not health or health == "healthy":
+            return True
+        await asyncio.sleep(1.0)
+
+    logger.warning(f"[DRILL] 等待 {container} 健康超时（{timeout}s），仍尝试取码")
+    return True
+
+
 async def _resolve_probe_code() -> Optional[str]:
     """拿一个**真实存在**的短链码用于探测
 
@@ -349,25 +421,70 @@ async def _resolve_probe_code() -> Optional[str]:
 
     优先级：
       1. 显式配置 settings.drill_probe_code
-      2. 否则从 Redis scan 出真实 key 再反解 code
+      2. 否则先确保 Redis 在跑（见 _ensure_running），再 scan 出真实 key
     """
     if settings.drill_probe_code:
         return settings.drill_probe_code
 
+    container = settings.drill_probe_container
+    if not await _ensure_running(container):
+        return None
+
     try:
         proc = await asyncio.create_subprocess_exec(
-            "docker", "exec", "shortlink-redis",
+            "docker", "exec", container,
             "redis-cli", "--scan", "--pattern", "sl:link:*",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        code = None
         for line in (out or b"").decode(errors="replace").splitlines():
             line = line.strip()
             if line.startswith("sl:link:"):
-                return line.split("sl:link:", 1)[1]
+                code = line.split("sl:link:", 1)[1]
+                break
+        if code:
+            return code
+        # 缓存是空的（Redis 刚被自愈重启过、或 key 已过期）：新建一条短链。
+        # 库里真实存在的 code 就够了 —— 跳转请求会先查 Redis，Redis 停机时
+        # 照样卡在连接上，与缓存里有没有这条无关。
+        logger.warning("[DRILL] Redis 中无 sl:link:* 缓存，改为新建一条短链")
+        return await _create_probe_code()
     except Exception as e:  # noqa: BLE001
         logger.warning(f"[DRILL] 从 Redis 获取短链码失败: {e}")
+    return None
+
+
+async def _create_probe_code() -> Optional[str]:
+    """缓存为空时新建一条短链，拿它的 code 作为探测码
+
+    只在 Redis 已在运行（_ensure_running 之后）时调用：创建接口有基于
+    Redis 的 IP 限流（默认 5 次/分钟），Redis 停机时会直接失败 ——
+    这也是为什么必须先拉起 Redis 再取码。
+    """
+    # 重试几次：Redis 刚被拉起时应用侧的连接池可能还没重建完，
+    # 实测第一次创建会直接失败（返回空 body）。
+    for attempt in range(1, 4):
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "curl", "-s", "--max-time", "10", "-X", "POST",
+                "-H", "Content-Type: application/json",
+                "-d", json.dumps({"longUrl": settings.drill_probe_long_url}),
+                f"{settings.shortlink_base_url.rstrip('/')}/api/v1/links",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+            payload = json.loads((out or b"").decode(errors="replace") or "{}")
+            code = payload.get("code")
+            if code:
+                logger.warning(f"[DRILL] 新建探测短链码: {code}")
+                return code
+            logger.warning(f"[DRILL] 新建短链未返回 code（第 {attempt} 次）: {payload}")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[DRILL] 新建短链失败（第 {attempt} 次）: {e}")
+        await asyncio.sleep(2)
     return None
 
 
@@ -385,8 +502,11 @@ async def _probe_load(code: Optional[str] = None) -> dict:
         - timeout 要跨过 Prometheus 抓取周期（15s）：否则连接在
           被采到之前就释放了，指标上依然看不到堆积
     """
-    if not code:  # 调用方未取到时兜底再试一次
-        code = await _resolve_probe_code()
+    # 注意这里**不能**再回退到 _resolve_probe_code()：它为了保证能取到码
+    # 会先把 Redis 拉起来（见 _ensure_running），而此时故障已经注入 ——
+    # 那等于把刚停掉的容器又偷偷恢复了，探测请求压根不会挂起。
+    # 实测踩过：演练日志里出现「docker stop」后紧接着「未运行，先拉起」，
+    # 结果 dependency_hang 永远不成立。
     if not code:
         logger.warning("[DRILL] 未拿到探测短链码，跳过探测负载")
         return {"requests": 0, "timeout_seconds": 0, "skipped": True}

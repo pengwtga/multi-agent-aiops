@@ -68,13 +68,18 @@ class WorkflowNode:
         agent: BaseAgent,
         condition: Optional[Callable[[IncidentState], bool]] = None,
         max_retries: int = 3,
+        skip_reason: Optional[str] = None,
     ):
         self.name = name
         self.agent = agent
         self.condition = condition
+        self.skip_reason = skip_reason
         self.max_retries = max_retries
         self.status = NodeStatus.PENDING
         self.retry_count = 0
+        # 跳过原因（人话），用于 Dashboard 在「已跳过」节点上说明为什么不跑。
+        # 没有它，用户只能看到一排「已跳过/待执行」，却不知道是低置信度、
+        # 审批未通过还是别的闸门拦下的。
         # 本次执行的开始/结束时刻与耗时（毫秒），供 Dashboard 展示节点运行时间。
         # 这是「本次闭环」的值：每次 run() 覆盖，reset_workflow() 清空。
         # 之所以要单独记，是因为 agent.get_metrics() 里的 avg_latency_ms
@@ -155,6 +160,7 @@ class Orchestrator:
                 name="rca",
                 agent=rca,
                 condition=lambda s: s.alert_event is not None,
+                skip_reason="本轮监控未触发告警",
             ),
             WorkflowNode(
                 name="heal_propose",
@@ -162,11 +168,13 @@ class Orchestrator:
                 condition=lambda s: (
                     s.rca_event is not None and s.rca_event.confidence >= 0.3
                 ),
+                skip_reason="根因置信度不足（< 0.3），证据不足不提议自愈",
             ),
             WorkflowNode(
                 name="change",
                 agent=change,
                 condition=lambda s: s.heal_event is not None,
+                skip_reason="没有待审批的自愈方案",
             ),
             WorkflowNode(
                 name="heal_execute",
@@ -177,6 +185,7 @@ class Orchestrator:
                     and s.change_event is not None
                     and s.change_event.approval_status == "approved"
                 ),
+                skip_reason="变更审批未通过，闸门未放行不执行",
             ),
         ]
 
@@ -204,7 +213,15 @@ class Orchestrator:
         for node in self._nodes:
             if not node.should_execute(state):
                 node.status = NodeStatus.SKIPPED
-                logger.info(f"[Orchestrator] Skipping node: {node.name}")
+                logger.info(
+                    f"[Orchestrator] Skipping node: {node.name} "
+                    f"({node.skip_reason or '条件不满足'})"
+                )
+                # 跳过也要发快照：否则被闸门拦下的节点在 Dashboard 上一直是
+                # 「待执行」，看着像流水线卡在这一步不往下走（实测踩过：
+                # 低置信度告警停在根因分析，后面三个节点永远「待执行」）。
+                if state.alert_event is not None:
+                    self._last_alert_workflow = self.get_workflow_status()
                 continue
 
             node.status = NodeStatus.RUNNING
@@ -324,6 +341,7 @@ class Orchestrator:
                 "status": node.status.value,
                 "agent_type": node.agent.agent_type.value,
                 "retry_count": node.retry_count,
+                "skip_reason": node.skip_reason,
                 "duration_ms": round(node.duration_ms, 1),
                 "started_at": (
                     node.started_at.isoformat() if node.started_at else None

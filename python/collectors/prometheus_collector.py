@@ -180,21 +180,34 @@ def build_shortlink_rules(job: str = SHORTLINK_JOB) -> list[AlertRule]:
 
 
 # 喂给统计异常检测层的基线指标（每周期采集，为 MonitorAgent 积累历史样本）
-BASELINE_QUERIES: list[dict[str, str]] = [
+#
+# min_delta = 噪声地板：相对近期中位数，振幅小于它的扰动**不算异常**。
+#
+# 为什么需要（实测踩出来的误报）：process_cpu_usage 常年在 0.0017~0.0057
+# （0.2%~0.6% CPU）之间抖动，方差极小，3-sigma/EWMA 随便一抖就能凑够
+# 2 票，于是报出 anomaly_app_cpu_usage [critical/medium] —— 一个毫无业务
+# 意义的告警，还会把演练后的流水线顶掉（它根因置信度只有 0.15，闭环停在
+# 根因分析，看着像「卡住」）。统计检测只回答「是否偏离分布」，不回答
+# 「偏离得有没有意义」，后者必须靠这个门槛补上。
+BASELINE_QUERIES: list[dict[str, Any]] = [
     {
         "metric_name": "consume_lag",
         "promql": f'sum(shortlink_consume_lag{{job="{SHORTLINK_JOB}"}})',
         "service": "click-consumer",
+        "min_delta": 500.0,
     },
     {
         "metric_name": "app_cpu_usage",
         "promql": f'process_cpu_usage{{job="{SHORTLINK_JOB}"}}',
         "service": "shortlink-app",
+        # 5 个百分点 CPU：低于此不值得告警
+        "min_delta": 0.05,
     },
     {
         "metric_name": "tomcat_busy_threads",
         "promql": f'sum(tomcat_threads_busy_threads{{job="{SHORTLINK_JOB}"}})',
         "service": "shortlink-app",
+        "min_delta": 5.0,
     },
 ]
 
@@ -300,6 +313,8 @@ class MonitorLoop:
                     "value": value,
                     "service": series["service"],
                     "labels": {"job": SHORTLINK_JOB},
+                    # 噪声地板交给 MonitorAgent：命中异常但振幅不够就不告警
+                    "min_delta": series.get("min_delta"),
                 },
             })
             if state.alert_event is not None:

@@ -177,6 +177,21 @@ def build_state(
         if not wf_source:
             status = "monitoring" if idx == 0 else "idle"
         text, color = _style(status)
+        # 未跑（跳过/待执行）的节点不显示「0ms」——那会让人以为它跑过、
+        # 只是快；实际是一次都没执行。
+        duration_text = (
+            "—" if status in ("skipped", "pending", "idle", "monitoring")
+            else _fmt_duration(wf.get("duration_ms"))
+        )
+        # 跳过原因：告诉用户是被哪道闸门拦下的，而不是让人猜。
+        # heal_propose 最常见的是 RCA 置信度不足，把实际数字带上更直观。
+        note = ""
+        if status == "skipped":
+            note = wf.get("skip_reason") or ""
+            if key == "heal_propose":
+                confidence = ((active or {}).get("rca") or {}).get("confidence")
+                if confidence is not None:
+                    note = f"根因置信度 {confidence:.2f} < 0.3，不提议自愈"
         pipeline.append(
             {
                 "key": key,
@@ -185,9 +200,10 @@ def build_state(
                 "status": status,
                 "status_text": text,
                 "color": color,
+                "note": note,
                 "retry_count": wf.get("retry_count", 0),
                 "duration_ms": wf.get("duration_ms"),
-                "duration_text": _fmt_duration(wf.get("duration_ms")),
+                "duration_text": duration_text,
             }
         )
 
@@ -265,6 +281,7 @@ DASHBOARD_HTML = """
   .node .agent { font-size: 11px; color: var(--muted); }
   .node .st { font-size: 11px; margin-top: 4px; }
   .node .dur { font-size: 11px; margin-top: 2px; color: #64748b; }
+  .node .note { font-size: 10px; margin-top: 3px; line-height: 1.35; color: #f59e0b; }
   .conn { flex: 0 0 26px; align-self: center; height: 2px; background: var(--border);
           position: relative; top: -6px; }
   .conn.done { background: #10b981; }
@@ -367,6 +384,7 @@ function renderPipeline(state){
       + '<div class="agent">' + esc(n.agent) + '</div>'
       + '<div class="st" style="color:' + s[1] + '">' + esc(s[0]) + '</div>'
       + '<div class="dur">' + esc(n.duration_text) + '</div>'
+      + (n.note ? '<div class="note">' + esc(n.note) + '</div>' : '')
       + '</div>';
   }
   document.getElementById('pipeline').innerHTML = html;

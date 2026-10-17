@@ -179,6 +179,18 @@ class MonitorAgent(BaseAgent):
             is_anomaly, score = self._detect_anomaly(history, current_value)
             if not is_anomaly:
                 return state
+            # 噪声地板：统计上异常 ≠ 业务上有意义。振幅小于 min_delta 的
+            # 扰动直接抑制（详见 collectors.BASELINE_QUERIES 的注释）。
+            min_delta = metric_data.get("min_delta")
+            if min_delta and self._below_noise_floor(
+                history, current_value, float(min_delta)
+            ):
+                logger.info(
+                    f"[MonitorAgent] Anomaly suppressed (noise floor): "
+                    f"{metric_name} value={current_value:.4f} "
+                    f"|Δ| < {min_delta}, score={score:.2f}"
+                )
+                return state
             alert = self._build_statistical_alert(
                 metric_name, current_value, target_service,
                 labels, score, state.incident_id,
@@ -246,6 +258,23 @@ class MonitorAgent(BaseAgent):
             labels=labels,
             correlation_id=correlation_id,
         )
+
+    @staticmethod
+    def _below_noise_floor(
+        history: list[float], current: float, min_delta: float
+    ) -> bool:
+        """振幅是否小到没有业务意义（噪声地板）
+
+        与近期**中位数**比较而不是均值：中位数不会被异常样本自身拉高，
+        判定更稳。history 末尾是当前值，比较时要排除掉。
+        样本太少时不抑制 —— 冷启动阶段本来就不该轻易下结论，交给
+        _detect_anomaly 的样本数门槛去拦。
+        """
+        past = history[:-1]
+        if len(past) < 5:
+            return False
+        baseline = float(np.median(past))
+        return abs(current - baseline) < min_delta
 
     def _detect_anomaly(self, history: list[float], current: float) -> tuple[bool, float]:
         """多算法投票机制：至少两种算法认为异常才报警"""

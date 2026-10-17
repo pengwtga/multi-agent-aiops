@@ -70,6 +70,11 @@ class Settings(BaseSettings):
     # 探测用短链码。留空则自动从 Redis scan 一个真实存在的 code
     # （必须真实存在：不存在的 code 会被直接 404，碰不到 Redis，造不出挂起）
     drill_probe_code: str = ""
+    # 取探测码的容器（短链缓存所在）。取码前会先保证它在运行 ——
+    # 上一轮自愈若没跑到，Redis 可能仍是停止的，scan 必然失败
+    drill_probe_container: str = "shortlink-redis"
+    # 缓存为空时新建探测短链所用的长链接
+    drill_probe_long_url: str = "https://example.com/aiops-drill"
 
     model_config = {"env_prefix": "AIOPS_", "env_file": ".env"}
 
