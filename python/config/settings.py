@@ -22,9 +22,17 @@ class Settings(BaseSettings):
     neo4j_password: str = "aiops_password"
 
     # LLM
+    # 注意：本项目**不**用 LLM 判定根因，只用它补一条探针看不到的证据
+    # （见 agents/llm_evidence.py）。LLM 的输出是结构化证据而不是置信度，
+    # 直接拿它的概率去驱动自愈闸门是危险的 —— 它说的 0.8 不是校准过的概率。
     openai_api_key: Optional[str] = None
     openai_model: str = "gpt-4o-mini"
     openai_base_url: Optional[str] = None
+    # LLM 证据源开关：默认关闭。它是可选增强，关掉不影响任何现有闭环；
+    # 打开需要配置 AIOPS_OPENAI_API_KEY（否则自动保持关闭）
+    llm_evidence_enabled: bool = False
+    # 调用超时：RCA 在采集循环里同步调用，超时必须短，否则拖慢整个巡检周期
+    llm_timeout_seconds: float = 8.0
 
     # Prometheus
     prometheus_url: str = "http://localhost:9090"

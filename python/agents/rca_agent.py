@@ -25,6 +25,8 @@ from datetime import datetime
 from typing import Any, Optional, Protocol
 
 from agents.base_agent import BaseAgent
+from agents.llm_evidence import LLMEvidenceSource, OpenAICompatClient, blend_likelihood
+from config.settings import settings
 from core.event_bus import EventBus
 from models.events import (
     AgentType,
@@ -390,11 +392,31 @@ class RCAAgent(BaseAgent):
     """根因分析 Agent"""
 
     def __init__(self, event_bus: EventBus, knowledge_graph=None,
-                 evidence_provider: Optional[EvidenceProvider] = None):
+                 evidence_provider: Optional[EvidenceProvider] = None,
+                 llm_evidence: Optional[LLMEvidenceSource] = None):
         super().__init__(AgentType.RCA, event_bus, "RCAAgent")
         self._kg = knowledge_graph
         self._reasoner = BayesianReasoner()
         self._evidence_provider = evidence_provider
+        # LLM 证据源：可选增强，默认关闭。未显式注入时按配置自动构造，
+        # 配置不齐就保持为 None —— 现有闭环不依赖它。
+        if llm_evidence is None and settings.llm_evidence_enabled:
+            if settings.openai_api_key:
+                llm_evidence = LLMEvidenceSource(
+                    OpenAICompatClient(
+                        api_key=settings.openai_api_key,
+                        model=settings.openai_model,
+                        base_url=settings.openai_base_url
+                        or "https://api.openai.com/v1",
+                        timeout=settings.llm_timeout_seconds,
+                    )
+                )
+            else:
+                logger.warning(
+                    "[RCAAgent] llm_evidence_enabled=true 但未配置 "
+                    "AIOPS_OPENAI_API_KEY，LLM 证据源保持关闭"
+                )
+        self._llm_evidence = llm_evidence
 
     async def process(self, state: IncidentState) -> IncidentState:
         alert = state.alert_event
@@ -410,9 +432,33 @@ class RCAAgent(BaseAgent):
 
         candidates = self._get_fault_candidates(alert.alert_name)
 
+        # LLM 证据（可选增强）：一次调用覆盖全部候选，避免 N 次 API 往返。
+        # 只在「无探针 / 探针拿不到数据」的候选上起作用，详见 llm_evidence。
+        llm_evidence: dict[str, tuple[bool, float]] = {}
+        if self._llm_evidence is not None:
+            has_recent_change = any(
+                e["type"] == "recent_change" for e in evidence
+            )
+            llm_evidence = await self._llm_evidence.collect(
+                alert, candidates, has_recent_change
+            )
+            if llm_evidence:
+                # 权重刻意低于指标证据（0.8）与变更记录（0.9）：LLM 是补充，
+                # 不是裁判。写进 evidence 是为了可解释 —— 页面上能看到它
+                # 到底影响了哪条候选。
+                evidence.append({
+                    "type": "llm_evidence",
+                    "source": "llm",
+                    "detail": "; ".join(
+                        f"{name[:16]}… {'支持' if ok else '反对'}({s:.2f})"
+                        for name, (ok, s) in llm_evidence.items()
+                    ),
+                    "weight": 0.3,
+                })
+
         # 阶段 4：带 verify 探针的候选要回查 Prometheus 实测，故推理改为 async
         root_cause, confidence, actions = await self._bayesian_inference(
-            candidates, evidence
+            candidates, evidence, llm_evidence
         )
 
         rca_event = RCAEvent(
@@ -500,6 +546,7 @@ class RCAAgent(BaseAgent):
         self,
         candidates: list[dict[str, Any]],
         evidence: list[dict[str, Any]],
+        llm_evidence: Optional[dict[str, tuple[bool, float]]] = None,
     ) -> tuple[str, float, list[str]]:
         """贝叶斯推理选出最可能的根因（证据驱动）"""
         has_recent_change = any(e["type"] == "recent_change" for e in evidence)
@@ -513,7 +560,11 @@ class RCAAgent(BaseAgent):
 
         for candidate in candidates:
                 prior = candidate["base_probability"]
-                likelihood, verified = await self._compute_likelihood(candidate, has_recent_change)
+                likelihood, verified = await self._compute_likelihood(
+                    candidate,
+                    has_recent_change,
+                    (llm_evidence or {}).get(candidate["root_cause"]),
+                )
 
                 if candidate.get("verify"):
                     probed += 1
@@ -547,11 +598,16 @@ class RCAAgent(BaseAgent):
         return best_cause, round(best_confidence, 3), best_actions
 
     async def _compute_likelihood(
-        self, candidate: dict[str, Any], has_recent_change: bool
+        self,
+        candidate: dict[str, Any],
+        has_recent_change: bool,
+        llm_ev: Optional[tuple[bool, float]] = None,
     ) -> tuple[float, Optional[bool]]:
         """计算似然 P(Evidence|Cause)
 
-        优先用 verify 探针的实测值；无探针时退回静态 evidence_pattern 判断。
+        优先级：verify 探针实测 > LLM 证据 > 静态 evidence_pattern。
+        LLM 只在探针给不出结论（无探针 / 无数据）时补位 —— 一手信号永远
+        压过模型的猜测。
         """
         verify = candidate.get("verify")
         if not verify:
@@ -561,16 +617,22 @@ class RCAAgent(BaseAgent):
                 return BayesianReasoner.LIKELIHOOD_CONFIRMED, None
             if pattern == "recent_config_change" and has_recent_change:
                 return 0.85, None
-            return BayesianReasoner.LIKELIHOOD_UNKNOWN, None
+            return self._with_llm(
+                BayesianReasoner.LIKELIHOOD_UNKNOWN, llm_ev, candidate
+            ), None
 
         if self._evidence_provider is None:
             logger.debug("[RCAAgent] 无证据提供者，探针跳过，退回静态似然")
-            return BayesianReasoner.LIKELIHOOD_UNKNOWN, None
+            return self._with_llm(
+                BayesianReasoner.LIKELIHOOD_UNKNOWN, llm_ev, candidate
+            ), None
 
         value = await self._evidence_provider.query(verify["promql"])
         if value is None:
             logger.debug(f"[RCAAgent] 探针无数据: {verify['promql']}")
-            return BayesianReasoner.LIKELIHOOD_UNKNOWN, None
+            return self._with_llm(
+                BayesianReasoner.LIKELIHOOD_UNKNOWN, llm_ev, candidate
+            ), None
 
         if verify["comparator"] == "gt":
             holds = value > verify["threshold"]
@@ -587,3 +649,25 @@ class RCAAgent(BaseAgent):
             else BayesianReasoner.LIKELIHOOD_REFUTED,
             holds,
         )
+
+    @staticmethod
+    def _with_llm(
+        base: float,
+        llm_ev: Optional[tuple[bool, float]],
+        candidate: dict[str, Any],
+    ) -> float:
+        """把一条 LLM 证据融合进似然（仅当探针没给出结论时）
+
+        融合后仍夹在 [0.05, 0.9] 之内，与探针「证伪/成立」同档 —— LLM 无法
+        单独把置信度顶过自愈闸门，这是刻意的安全边界。
+        """
+        if not llm_ev:
+            return base
+        support, strength = llm_ev
+        blended = blend_likelihood(base, support, strength)
+        logger.info(
+            f"[RCAAgent] LLM 证据: {candidate['root_cause'][:20]}… "
+            f"{'支持' if support else '反对'}({strength:.2f}) → "
+            f"似然 {base:.2f} → {blended:.2f}"
+        )
+        return blended
