@@ -16,3 +16,6 @@ __pycache__/
 .env
 .env.local
 *.log
+
+# 本机专用：venv 路径写死为 /Users/pengximei/...，不入库
+python/start.sh
