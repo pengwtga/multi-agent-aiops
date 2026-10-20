@@ -193,13 +193,43 @@ class Orchestrator:
         self,
         initial_state: Optional[IncidentState] = None,
         metadata: Optional[dict] = None,
+        start_node: Optional[str] = None,
+        end_node: Optional[str] = None,
     ) -> IncidentState:
-        """执行完整的事件处理工作流"""
+        """执行事件处理工作流
+
+        Args:
+            initial_state: 初始状态
+            metadata: 附加元数据
+            start_node: 从指定节点开始执行，其之前的节点标记 SKIPPED（起点剪裁）。
+                用于「告警已知，跳过监控直接做根因分析」这类场景 ——
+                /api/v1/incidents/trigger 手动注入时就不必白跑一轮监控。
+            end_node: 在该节点执行（或因条件不满足而跳过）完成后立即停止
+                （终点剪裁）。用于「只出方案不执行」的演练场景。
+
+        节点名不存在时忽略并告警 —— 否则会静默地把整条流水线剪空，
+        表现为"点了没反应"，排查起来非常费劲。
+        """
         state = initial_state or IncidentState()
         if metadata:
             state.metadata = metadata
 
-        logger.info(f"[Orchestrator] Starting workflow for incident {state.incident_id}")
+        node_names = [n.name for n in self._nodes]
+        for label, target in (("start_node", start_node), ("end_node", end_node)):
+            if target is not None and target not in node_names:
+                logger.warning(
+                    f"[Orchestrator] {label}={target!r} 不在节点列表 {node_names} 中，忽略"
+                )
+                if label == "start_node":
+                    start_node = None
+                else:
+                    end_node = None
+
+        logger.info(
+            f"[Orchestrator] Starting workflow for incident {state.incident_id}"
+            + (f" (start={start_node})" if start_node else "")
+            + (f" (end={end_node})" if end_node else "")
+        )
 
         # 先把所有节点清空为 pending：否则还没轮到的节点会残留**上一轮**
         # run() 留下的状态（无告警的轮次会把它置为 SKIPPED），前端就会看到
@@ -210,7 +240,33 @@ class Orchestrator:
             node.ended_at = None
             node.duration_ms = 0.0
 
-        for node in self._nodes:
+        def _stop_after(idx: int, reason: str) -> None:
+            """终点之后的节点标记 SKIPPED。
+
+            不这么做的话它们会停在 PENDING，Dashboard 上显示成一排「待执行」，
+            看着像流水线卡在终点不动了 —— 与起点剪裁保持一致。
+            """
+            for rest in self._nodes[idx + 1:]:
+                rest.status = NodeStatus.SKIPPED
+                rest.skip_reason = reason
+
+        started = start_node is None
+        for idx, node in enumerate(self._nodes):
+            # ---- 起点剪裁 ----
+            if not started:
+                if node.name == start_node:
+                    started = True
+                else:
+                    node.status = NodeStatus.SKIPPED
+                    node.skip_reason = f"本次流程起点为 {start_node}，此节点在起点之前"
+                    logger.info(
+                        f"[Orchestrator] Skipping node: {node.name} "
+                        f"({node.skip_reason})"
+                    )
+                    if state.alert_event is not None:
+                        self._last_alert_workflow = self.get_workflow_status()
+                    continue
+
             if not node.should_execute(state):
                 node.status = NodeStatus.SKIPPED
                 logger.info(
@@ -222,6 +278,9 @@ class Orchestrator:
                 # 低置信度告警停在根因分析，后面三个节点永远「待执行」）。
                 if state.alert_event is not None:
                     self._last_alert_workflow = self.get_workflow_status()
+                if end_node is not None and node.name == end_node:
+                    _stop_after(idx, f"本次流程终点为 {end_node}，此节点在终点之后")
+                    break
                 continue
 
             node.status = NodeStatus.RUNNING
@@ -279,6 +338,14 @@ class Orchestrator:
                 self._last_alert_workflow = self.get_workflow_status()
 
             self._save_checkpoint(state)
+
+            # ---- 终点剪裁 ----
+            if end_node is not None and node.name == end_node:
+                logger.info(
+                    f"[Orchestrator] Reached end_node={end_node!r}，提前结束本次流程"
+                )
+                _stop_after(idx, f"本次流程终点为 {end_node}，此节点在终点之后")
+                break
 
         state.updated_at = datetime.utcnow()
         logger.info(
