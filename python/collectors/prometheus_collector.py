@@ -67,7 +67,7 @@ class AlertRule:
 
     name: str
     promql: str
-    comparator: str          # gt / lt
+    comparator: str  # gt / lt
     threshold: float
     severity: Severity
     target_service: str
@@ -105,7 +105,12 @@ def build_shortlink_rules(job: str = SHORTLINK_JOB) -> list[AlertRule]:
       这两个**占用类**信号来捕获挂起。
     """
     return [
+
         AlertRule(
+            # up 指标‌：Prometheus 自动生成的指标，表示抓取目标是否成功——1 代表在线，0 代表离线
+            # ‌取指定 job 下所有实例的 up 指标最小值‌，返回 1 表示该 job 全部实例在线，
+            # 返回 0 表示至少有一个实例离线
+
             name="shortlink_app_down",
             promql=f'min(up{{job="{job}"}})',
             comparator="lt",
@@ -162,7 +167,6 @@ def build_shortlink_rules(job: str = SHORTLINK_JOB) -> list[AlertRule]:
             #
             # 判据：连接被占住不释放，同时成功跳转吞吐归零。
             #   (连接数 > 20) and (成功跳转速率 < 0.05/s)
-            #
             # 两个操作数都必须 or vector(0) 兜底：rate() 在窗口内不足 2 个
             # 采样点时返回空，而挂起时 shortlink_redirect_total 可能压根没有
             # 序列（从未成功过）。返回空会让 `and` 直接失效导致漏报 ——
@@ -175,6 +179,9 @@ def build_shortlink_rules(job: str = SHORTLINK_JOB) -> list[AlertRule]:
                 f'{{job="{job}"}}[2m]))) or vector(0)) < 0.05'
                 " or vector(0)"
             ),
+
+
+
             comparator="gt",
             threshold=0.5,
             severity=Severity.CRITICAL,
@@ -225,12 +232,12 @@ class MonitorLoop:
     """监控主循环 — 周期性轮询 Prometheus 并驱动 Orchestrator 工作流"""
 
     def __init__(
-        self,
-        orchestrator,
-        prometheus_url: str = "http://localhost:9090",
-        interval_seconds: int = 30,
-        rules: Optional[list[AlertRule]] = None,
-        on_cycle: Optional[Callable[[Any], None]] = None,
+            self,
+            orchestrator,
+            prometheus_url: str = "http://localhost:9090",
+            interval_seconds: int = 30,
+            rules: Optional[list[AlertRule]] = None,
+            on_cycle: Optional[Callable[[Any], None]] = None,
     ):
         self._orchestrator = orchestrator
         self._client = PrometheusClient(prometheus_url)
