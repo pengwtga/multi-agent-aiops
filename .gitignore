@@ -19,3 +19,7 @@ __pycache__/
 
 # 本机专用：venv 路径写死为 /Users/pengximei/...，不入库
 python/start.sh
+
+# 先验学习库：运行时生成的历史根因计数（见 python/agents/prior_store.py）
+# 是运行产物而非源码 —— 每台机器积累的故障分布不同，不该进版本库
+python/data/

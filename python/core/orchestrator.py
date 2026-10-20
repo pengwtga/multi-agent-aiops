@@ -38,6 +38,7 @@ from typing import Any, Callable, Optional
 
 from agents.base_agent import BaseAgent
 from agents.monitor_agent import MonitorAgent
+from agents.prior_store import SQLitePriorStore
 from agents.rca_agent import RCAAgent
 from agents.heal_agent import (
     CircuitBreaker,
@@ -45,6 +46,7 @@ from agents.heal_agent import (
     HealProposeAgent,
 )
 from agents.change_agent import ChangeAgent
+from config.settings import settings
 from core.event_bus import EventBus
 from models.events import AgentType, IncidentState
 
@@ -113,6 +115,18 @@ class Orchestrator:
         self.event_bus = event_bus
         # 阶段 4：证据提供者（PrometheusClient）注入 RCAAgent，用于回查实测值证实/证伪候选根因
         self._evidence_provider = evidence_provider
+        # 先验学习：从历史闭环里学 sharp/纠正 base_probability。
+        # 默认开启是安全的（无数据时精确回退到人工先验），失败则退回 None，
+        # 绝不能让学习功能把根因分析拖垮。
+        self._prior_store: Optional[SQLitePriorStore] = None
+        if settings.prior_learning_enabled:
+            try:
+                self._prior_store = SQLitePriorStore(
+                    db_path=settings.prior_db_path,
+                    alpha=settings.prior_alpha,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[Orchestrator] 先验存储器初始化失败，沿用人工先验: {e}")
         # 阶段 5：自愈执行的安全护栏（dry_run 默认开 = 只演练不执行）
         self._heal_dry_run = heal_dry_run
         self._heal_max_blast_radius = heal_max_blast_radius
@@ -133,7 +147,11 @@ class Orchestrator:
     def _build_default_workflow(self) -> None:
         """构建默认工作流：Monitor → RCA → HealPropose → Change → HealExecute"""
         monitor = MonitorAgent(self.event_bus)
-        rca = RCAAgent(self.event_bus, evidence_provider=self._evidence_provider)
+        rca = RCAAgent(
+            self.event_bus,
+            evidence_provider=self._evidence_provider,
+            prior_store=self._prior_store,
+        )
         change = ChangeAgent(self.event_bus)
 
         # 提议与执行共享同一个熔断器：否则两边各记一套失败计数，
@@ -346,6 +364,19 @@ class Orchestrator:
                 )
                 _stop_after(idx, f"本次流程终点为 {end_node}，此节点在终点之后")
                 break
+
+        # 先验学习：只有「自愈真的执行成功且验证通过」才算这次判对了。
+        # dry_run 不会走到 resolved（HealExecuteAgent 里直接 return），
+        # 因此不会被误记成一次成功案例。
+        if (
+            self._prior_store is not None
+            and state.status == "resolved"
+            and state.alert_event is not None
+            and state.rca_event is not None
+        ):
+            self._prior_store.record(
+                state.alert_event.alert_name, state.rca_event.root_cause
+            )
 
         state.updated_at = datetime.utcnow()
         logger.info(

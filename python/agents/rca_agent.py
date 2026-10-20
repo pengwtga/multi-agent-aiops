@@ -26,6 +26,7 @@ from typing import Any, Optional, Protocol
 
 from agents.base_agent import BaseAgent
 from agents.llm_evidence import LLMEvidenceSource, OpenAICompatClient, blend_likelihood
+from agents.prior_store import SQLitePriorStore
 from config.settings import settings
 from core.event_bus import EventBus
 from models.events import (
@@ -393,7 +394,8 @@ class RCAAgent(BaseAgent):
 
     def __init__(self, event_bus: EventBus, knowledge_graph=None,
                  evidence_provider: Optional[EvidenceProvider] = None,
-                 llm_evidence: Optional[LLMEvidenceSource] = None):
+                 llm_evidence: Optional[LLMEvidenceSource] = None,
+                 prior_store: Optional["SQLitePriorStore"] = None):
         super().__init__(AgentType.RCA, event_bus, "RCAAgent")
         self._kg = knowledge_graph
         self._reasoner = BayesianReasoner()
@@ -417,6 +419,22 @@ class RCAAgent(BaseAgent):
                     "AIOPS_OPENAI_API_KEY，LLM 证据源保持关闭"
                 )
         self._llm_evidence = llm_evidence
+
+        # 先验存储器：让 base_probability 从历史闭环里学习。
+        # 未显式注入时按配置自动构造；构造失败就退回 None（用写死的先验），
+        # 先验学习永远不能让根因分析跑不起来。
+        if prior_store is None and settings.prior_learning_enabled:
+            try:
+                prior_store = SQLitePriorStore(
+                    db_path=settings.prior_db_path,
+                    alpha=settings.prior_alpha,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    f"[RCAAgent] 先验存储器初始化失败，沿用人工先验: {e}"
+                )
+                prior_store = None
+        self._prior_store = prior_store
 
     async def process(self, state: IncidentState) -> IncidentState:
         alert = state.alert_event
@@ -458,7 +476,7 @@ class RCAAgent(BaseAgent):
 
         # 阶段 4：带 verify 探针的候选要回查 Prometheus 实测，故推理改为 async
         root_cause, confidence, actions = await self._bayesian_inference(
-            candidates, evidence, llm_evidence
+            alert.alert_name, candidates, evidence, llm_evidence
         )
 
         rca_event = RCAEvent(
@@ -544,6 +562,7 @@ class RCAAgent(BaseAgent):
 
     async def _bayesian_inference(
         self,
+        alert_name: str,
         candidates: list[dict[str, Any]],
         evidence: list[dict[str, Any]],
         llm_evidence: Optional[dict[str, tuple[bool, float]]] = None,
@@ -559,7 +578,14 @@ class RCAAgent(BaseAgent):
         refuted = 0
 
         for candidate in candidates:
-                prior = candidate["base_probability"]
+                manual_prior = candidate["base_probability"]
+                # 先验融合：有历史闭环数据时用计数平滑后的值，否则原样返回人工先验。
+                # 这一步是唯一的改动点 —— 下游的贝叶斯公式一字未改。
+                prior = (
+                    self._prior_store.prior(alert_name, candidate["root_cause"], manual_prior)
+                    if self._prior_store is not None
+                    else manual_prior
+                )
                 likelihood, verified = await self._compute_likelihood(
                     candidate,
                     has_recent_change,

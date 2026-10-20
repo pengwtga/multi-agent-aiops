@@ -37,6 +37,19 @@ class Settings(BaseSettings):
     # Prometheus
     prometheus_url: str = "http://localhost:9090"
 
+    # 先验学习：让故障模式库的 base_probability 从历史闭环里学出来，
+    # 替代人工写死的经验值（详见 agents/prior_store.py）
+    # 默认开启是**安全**的：没有历史数据时 Dirichlet 平滑会精确回退到人工先验，
+    # 行为与原逻辑完全一致，数据积累后才逐步向真实频率收敛
+    prior_learning_enabled: bool = True
+    # SQLite 落盘路径（相对工作目录）。这是唯一需要持久化的学习产物，
+    # 用 SQLite 而非向量库：先验学习本质是计数统计，不需要 embedding
+    prior_db_path: str = "data/priors.db"
+    # 伪计数总量 α：控制对人工先验的信任强度。
+    # α=10 表示约需 10 次观测，历史数据才能明显压过人工先验。
+    # 调大 = 学习更慢更保守；调小 = 更快采信数据但早期易受噪声影响
+    prior_alpha: float = 10.0
+
     # Agent 配置
     monitor_enabled: bool = True   # 阶段 3：Prometheus 真实采集循环开关
     monitor_check_interval: int = 30

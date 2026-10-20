@@ -28,6 +28,8 @@ from models.events import AlertEvent, IncidentState, Severity
 # 假服务收到的请求与要返回的“模型回答”
 RECEIVED: list[dict] = []
 REPLY: list[str] = ['{"evidence": []}']
+# _bayesian_inference 的第一个参数（告警名，用于先验学习的分组 key）
+ALERT_NAME = "redirect_5xx_rate"
 FAIL_MODE = [""]
 
 
@@ -107,7 +109,7 @@ async def posterior_with_llm(rca, strength, support=True):
     """直接算后验：绕开故障模式库，精确控制先验与证据"""
     ev = {"近期部署引入缺陷": (support, strength)}
     cause, conf, _ = await rca._bayesian_inference(
-        NO_PROBE_CANDIDATE, [], ev
+        ALERT_NAME, NO_PROBE_CANDIDATE, [], ev
     )
     return conf
 
