@@ -137,6 +137,30 @@ def build_shortlink_rules(job: str = SHORTLINK_JOB) -> list[AlertRule]:
             kind="symptom",
         ),
         AlertRule(
+            # 创建链路专属规则（补 §5.26 记录的观测缺口）
+            #
+            # 为什么需要单独一条：redirect_5xx_rate 统计的是**全部端点**的 5xx，
+            # 创建接口的 5xx 混在里面。虽然阈值是绝对速率（不会被跳转的巨大
+            # 流量稀释），但命中后告警名仍是 redirect_5xx_rate，故障模式库会
+            # 匹配到「跳转」那套候选 —— 跳转探针查的是跳转吞吐、连接超时，
+            # 对「创建写失败」基本没有区分力，最后大概率落到「未定位根因」。
+            #
+            # 这里用 uri 过滤出创建端点，并标为 root_cause（独立开闭环），
+            # 让它走 create_failure 专属候选。
+            name="create_5xx_rate",
+            promql=(
+                f'sum(rate(http_server_requests_seconds_count'
+                f'{{job="{job}",uri="/api/v1/links",status=~"5.."}}[1m]))'
+            ),
+            comparator="gt",
+            threshold=0.5,
+            severity=Severity.HIGH,
+            target_service="shortlink-app",
+            metric_name="create_5xx_rate",
+            description="创建短链接口 5xx 速率超过 0.5 req/s",
+            kind="root_cause",
+        ),
+        AlertRule(
             name="consume_lag_backlog",
             promql=f'sum(shortlink_consume_lag{{job="{job}"}})',
             comparator="gt",
@@ -179,9 +203,6 @@ def build_shortlink_rules(job: str = SHORTLINK_JOB) -> list[AlertRule]:
                 f'{{job="{job}"}}[2m]))) or vector(0)) < 0.05'
                 " or vector(0)"
             ),
-
-
-
             comparator="gt",
             threshold=0.5,
             severity=Severity.CRITICAL,

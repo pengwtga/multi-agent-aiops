@@ -222,6 +222,60 @@ SHORTLINK_FAULT_PATTERNS: dict[str, list[dict[str, Any]]] = {
             "suggested_actions": ["check_dependency", "restart_container"],
         },
     ],
+    # 创建链路专属候选（补 §5.26 记录的缺口）
+    #
+    # 为什么需要它：创建是**写路径**，坏因与跳转完全不同 —— 跳转关心的是
+    # 「读不到 / 挂住」，创建关心的是「写不进去」。此前创建接口的 5xx 会命中
+    # redirect_5xx_rate，走跳转那套候选，而跳转探针（跳转吞吐、连接超时）对
+    # 创建失败基本没有区分力。
+    #
+    # ★ key 必须等于告警名：`_get_fault_candidates` 用子串匹配
+    # （pattern_key in normalized or normalized in pattern_key），
+    # create_5xx_rate 与 create_failure 互不为子串，取错名字会静默落到
+    # FALLBACK_FAULT_PATTERNS —— 症状是"能告警但永远定位不出"，很难排查。
+    #
+    # 探针设计同样遵守「必须能证伪」：判据只在坏因成立时才为真。
+    "create_5xx_rate": [
+        {
+            "root_cause": "MySQL 写入失败（连接池打满 / 主库不可写）",
+            "evidence_pattern": "db_write_error",
+            "base_probability": 0.45,
+            "verify": _verify(
+                'sum(hikaricp_connections_pending{job="shortlink-app"})',
+                "gt", 5.0,
+            ),
+            "suggested_actions": ["check_mysql", "restart_mysql"],
+        },
+        {
+            "root_cause": "Redis 回填失败 —— 创建的事务里包含缓存写入，"
+                          "Redis 不可达会让整个创建回滚",
+            "evidence_pattern": "dependency_down",
+            "base_probability": 0.30,
+            "verify": _verify(
+                'sum(rate(shortlink_redirect_total{job="shortlink-app",'
+                'outcome="hit"}[30s]))',
+                "lt", 0.05,
+            ),
+            "suggested_actions": ["restart_redis", "check_dependency"],
+        },
+        {
+            "root_cause": "创建接口限流阈值过低（5 次/60s）被正常流量打满",
+            "evidence_pattern": "rate_limited",
+            "base_probability": 0.15,
+            "verify": _verify(
+                'sum(rate(shortlink_ratelimit_rejected_total'
+                '{job="shortlink-app",scene="create"}[1m]))',
+                "gt", 1.0,
+            ),
+            "suggested_actions": ["check_dependency"],
+        },
+        {
+            "root_cause": "雪花 ID 时钟回拨导致主键冲突",
+            "evidence_pattern": "id_conflict",
+            "base_probability": 0.10,
+            "suggested_actions": ["check_dependency"],
+        },
+    ],
     "consume_lag_backlog": [
         {
             "root_cause": "消费端卡死（位点停止推进，批量拉取线程阻塞）",
